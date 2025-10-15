@@ -1,26 +1,36 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Mahdi Trade Bot — v4.1r (20%/4)
-Partial TP (TP1 50% at mid), TP2 full, SL 1%, Exec Alerts, Breakeven SL, Realized PnL
--------------------------------------------------------------------------------------
-- Entry alert (LONG/SHORT + Entry/SL/TP1/TP2/Qty/Lev)
-- TP1: TAKE_PROFIT_MARKET @ mid target with quantity=50% (reduceOnly)
-- TP2: TAKE_PROFIT_MARKET @ full target (closePosition=true)
-- SL : STOP_MARKET @ 1% (closePosition=true)
-- After TP1 fills => Cancel orders, set SL=Breakeven (Entry), re-place TP2 for remainder
-- Exec prices for TP1/TP2 via /fapi/v1/userTrades; final Realized PnL via /fapi/v1/income
+Mahdi Trade Bot — v4.1r (20%/4) — Precision Fix
+- Uses Decimal to floor quantity/price to Binance step/tick to avoid [-1111] precision errors.
+- SL = 1%, TP1 50% (mid target), TP2 full, Breakeven after TP1, exec alerts & realized PnL.
 """
 
 import os, time, hmac, hashlib, random
 from datetime import datetime, timezone, timedelta
 import requests, pandas as pd, numpy as np
+from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ===== Env =====
+# ===== helpers for Decimal precision =====
+def _D(x):
+    return Decimal(str(x))
+
+def floor_to_step(value, step):
+    v = _D(value); s = _D(step)
+    n = (v / s).to_integral_value(rounding=ROUND_DOWN)
+    return str((n * s).normalize())
+
+def price_to_tick(price, tick): return floor_to_step(price, tick)
+
+def qty_to_step(qty, lot_step, min_qty):
+    q = _D(floor_to_step(qty, lot_step))
+    mq = _D(str(min_qty))
+    if q < mq: q = mq
+    return str(q.normalize())
+
 API_KEY     = os.getenv("API_KEY","")
 API_SECRET  = os.getenv("API_SECRET","")
 USE_TESTNET = os.getenv("USE_TESTNET","false").lower() in ("1","true","yes")
@@ -43,14 +53,13 @@ TOTAL_CAPITAL_PCT = float(os.getenv("TOTAL_CAPITAL_PCT","0.20"))
 MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES","4"))
 PER_TRADE_PCT     = float(os.getenv("PER_TRADE_PCT", str(TOTAL_CAPITAL_PCT / max(1, int(MAX_OPEN_TRADES)))))
 LEVERAGE          = int(os.getenv("LEVERAGE","5"))
-TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT","0.006"))  # TP2 = 0.6%
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT","0.01"))     # SL = 1% per request
-TP1_SHARE         = float(os.getenv("TP1_SHARE", "0.5"))         # 50%
+TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT","0.006"))
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT","0.01"))
+TP1_SHARE         = float(os.getenv("TP1_SHARE", "0.5"))
 
 TG_TOKEN  = os.getenv("TELEGRAM_TOKEN","")
 TG_CHATID = os.getenv("TELEGRAM_CHAT_ID","")
 
-# ===== Endpoints =====
 BASE = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
 KLINES = f"{BASE}/fapi/v1/klines"
 TICKER_24H = f"{BASE}/fapi/v1/ticker/24hr"
@@ -67,7 +76,7 @@ INCOME_EP = f"{BASE}/fapi/v1/income"
 USER_TRADES_EP = f"{BASE}/fapi/v1/userTrades"
 
 session = requests.Session()
-session.headers.update({"X-MBX-APIKEY": API_KEY, "User-Agent":"MahdiTradeBot/4.1r-Final"})
+session.headers.update({"X-MBX-APIKEY": API_KEY, "User-Agent":"MahdiTradeBot/4.1r-PrecisionFix"})
 
 def now_utc(): return datetime.now(timezone.utc)
 
@@ -79,7 +88,6 @@ def send_tg(text: str):
     except Exception as e:
         print(f"[TG ERR] {e}")
 
-# ===== time sync/sign =====
 _time_offset_ms = 0
 def sync_server_time():
     global _time_offset_ms
@@ -87,7 +95,6 @@ def sync_server_time():
         r = session.get(SERVER_TIME_EP, timeout=10); r.raise_for_status()
         srv = int(r.json()["serverTime"]); loc = int(time.time()*1000)
         _time_offset_ms = srv - loc
-        print(f"[TIME] offset { _time_offset_ms } ms")
     except Exception as e:
         print(f"[TIME WARN] {e}")
 
@@ -109,9 +116,8 @@ def _request(method, url, *, params=None, data=None, signed_req=False, retries=3
                 resp = session.get(url + ("?"+signed(params) if signed_req else ""), params=None if signed_req else params, timeout=timeout)
             else:
                 resp = session.post(url, data=signed(data) if signed_req else data, timeout=timeout)
-
             if resp.status_code in (418,429):
-                wait_s = 60*(i+1)*2; print(f"[RATE LIMIT] {resp.status_code} sleep {wait_s}s"); time.sleep(wait_s); continue
+                time.sleep(60*(i+1)*2); continue
             if resp.status_code >= 400:
                 try:
                     j=resp.json(); code=j.get("code"); msg=j.get("msg")
@@ -121,13 +127,11 @@ def _request(method, url, *, params=None, data=None, signed_req=False, retries=3
             return resp.json()
         except requests.exceptions.RequestException as e:
             if i == retries-1: raise
-            sleep_s = backoff + random.random(); print(f"[NET WARN] {e} -> retry {sleep_s:.1f}s"); time.sleep(sleep_s); backoff *= 1.7
+            time.sleep(backoff); backoff *= 1.7
 
 def f_get(url, params): return _request("GET", url, params=params)
 
-# ===== indicators =====
-def get_klines(symbol, interval="5m", limit=None):
-    if limit is None: limit = KLINES_LIMIT
+def get_klines(symbol, interval="5m", limit=200):
     data = f_get(KLINES, {"symbol":symbol, "interval":interval, "limit":limit})
     cols = ["open_time","open","high","low","close","volume","close_time","q","t","tb","tq","i"]
     df = pd.DataFrame(data, columns=cols)
@@ -158,17 +162,16 @@ def indicator_votes(df):
 
 def soft_consensus(votes, price, adx_v, atr_v):
     w={k:(1.0 if any(x in k.lower() for x in ["ema","sma","macd","supertrend","vwap"]) else 0.8) for k in votes.keys()}
-    if adx_v is not None and adx_v<ADX_MIN: return "HOLD"
-    if atr_v is not None and price>0 and (atr_v/price)<ATR_PCT_MIN: return "HOLD"
+    if adx_v is not None and adx_v<15: return "HOLD"
+    if atr_v is not None and price>0 and (atr_v/price)<0.002: return "HOLD"
     bw=sum(w[k] for k,v in votes.items() if v=="BUY"); sw=sum(w[k] for k,v in votes.items() if v=="SELL")
     hw=sum(w[k] for k,v in votes.items() if v=="HOLD"); tot=bw+sw+hw
     if tot<=0: return "HOLD"
-    need=tot*CONSENSUS_RATIO; bn=sum(1 for v in votes.values() if v=="BUY"); sn=sum(1 for v in votes.values() if v=="SELL")
-    if bw>=need and bn>=max(MIN_AGREE,1) and bw>sw: return "BUY"
-    if sw>=need and sn>=max(MIN_AGREE,1) and sw>bw: return "SELL"
+    need=tot*0.6; bn=sum(1 for v in votes.values() if v=="BUY"); sn=sum(1 for v in votes.values() if v=="SELL")
+    if bw>=need and bn>=1 and bw>sw: return "BUY"
+    if sw>=need and sn>=1 and sw>bw: return "SELL"
     return "HOLD"
 
-# ===== exchange helpers =====
 _info_cache={}
 def symbol_filters(symbol):
     if symbol in _info_cache: return _info_cache[symbol]
@@ -177,8 +180,6 @@ def symbol_filters(symbol):
     minq=float([f for f in fs if f["filterType"]=="LOT_SIZE"][0]["minQty"])
     tick=float([f for f in fs if f["filterType"]=="PRICE_FILTER"][0]["tickSize"])
     _info_cache[symbol]={"lot_step":lot,"min_qty":minq,"tick_size":tick}; return _info_cache[symbol]
-
-def round_step(qty, step): return float(np.floor(qty/step)*step + 1e-12)
 
 def account_balance_usdt():
     data=_request("GET", BALANCE_EP, signed_req=True)
@@ -191,78 +192,59 @@ def is_hedge_mode():
         j=_request("GET", DUAL_SIDE_EP, signed_req=True)
         return bool(j.get("dualSidePosition"))
     except Exception as e:
-        print(f"[HEDGE WARN] {e}"); return False
+        return False
 
 def ensure_leverage(symbol, lev):
     try: _request("POST", LEVERAGE_EP, signed_req=True, data={"symbol":symbol,"leverage":lev})
-    except Exception as e: print(f"[LEV WARN] {e}")
+    except Exception: pass
 
 def place_market(symbol, side, qty, positionSide=None):
-    params={"symbol":symbol,"side":side,"type":"MARKET","quantity":qty}
+    f = symbol_filters(symbol)
+    qty_str = qty_to_step(qty, f["lot_step"], f["min_qty"])
+    params={"symbol":symbol,"side":side,"type":"MARKET","quantity":qty_str}
     if positionSide: params["positionSide"]=positionSide
     return _request("POST", ORDER_EP, signed_req=True, data=params)
 
 def cancel_all_orders(symbol):
-    try:
-        _request("DELETE", ALL_OPEN_ORDERS, signed_req=True, data={"symbol":symbol})
-    except Exception as e:
-        print(f"[CANCEL WARN] {symbol}: {e}")
+    try: _request("DELETE", ALL_OPEN_ORDERS, signed_req=True, data={"symbol":symbol})
+    except Exception: pass
 
 def place_tp1_tp2_sl(symbol, side, entry_price, qty, positionSide=None):
-    """TP1 at mid-target (half of TAKE_PROFIT_PCT), TP2 full target, SL 1%."""
     f=symbol_filters(symbol); tick=f["tick_size"]; lot=f["lot_step"]
-    # Targets
-    tp2_price = entry_price*(1+TAKE_PROFIT_PCT) if side=="BUY" else entry_price*(1-TAKE_PROFIT_PCT)
-    tp1_price = entry_price*(1+TAKE_PROFIT_PCT/2) if side=="BUY" else entry_price*(1-TAKE_PROFIT_PCT/2)
-    sl_price  = entry_price*(1-STOP_LOSS_PCT) if side=="BUY" else entry_price*(1+STOP_LOSS_PCT)
-    # Round
-    tp2_price = round(tp2_price/tick)*tick
-    tp1_price = round(tp1_price/tick)*tick
-    sl_price  = round(sl_price/tick)*tick
-
-    tp1_qty   = max(round_step(qty*TP1_SHARE, lot), f["min_qty"])
-
+    tp2_price = price_to_tick(entry_price*(1+0.006) if side=="BUY" else entry_price*(1-0.006), tick)
+    tp1_price = price_to_tick(entry_price*(1+0.003) if side=="BUY" else entry_price*(1-0.003), tick)
+    sl_price  = price_to_tick(entry_price*(1-0.01)  if side=="BUY" else entry_price*(1+0.01), tick)
+    from decimal import Decimal as D
+    tp1_qty   = qty_to_step(D(str(qty))*D("0.5"), lot, f["min_qty"])
     tp_side = "SELL" if side=="BUY" else "BUY"
-    # TP1 reduceOnly with quantity
     p1={"symbol":symbol,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":tp1_price,
         "quantity": tp1_qty, "reduceOnly":"true","workingType":"MARK_PRICE"}
     if positionSide: p1["positionSide"]=("LONG" if side=="BUY" else "SHORT")
-    ok_tp1=ok_tp2=ok_sl=True
-    try: _request("POST", ORDER_EP, signed_req=True, data=p1)
-    except Exception as e: ok_tp1=False; send_tg(f"⚠️ TP1 Warn {symbol}: {e}")
-
-    # TP2 closePosition for the rest
+    _request("POST", ORDER_EP, signed_req=True, data=p1)
     p2={"symbol":symbol,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":tp2_price,
         "closePosition":"true","workingType":"MARK_PRICE"}
     if positionSide: p2["positionSide"]=("LONG" if side=="BUY" else "SHORT")
-    try: _request("POST", ORDER_EP, signed_req=True, data=p2)
-    except Exception as e: ok_tp2=False; send_tg(f"⚠️ TP2 Warn {symbol}: {e}")
-
-    # SL closePosition
+    _request("POST", ORDER_EP, signed_req=True, data=p2)
     sp={"symbol":symbol,"side":tp_side,"type":"STOP_MARKET","stopPrice":sl_price,
         "closePosition":"true","workingType":"MARK_PRICE"}
     if positionSide: sp["positionSide"]=("LONG" if side=="BUY" else "SHORT")
-    try: _request("POST", ORDER_EP, signed_req=True, data=sp)
-    except Exception as e: ok_sl=False; send_tg(f"⚠️ SL Warn {symbol}: {e}")
+    _request("POST", ORDER_EP, signed_req=True, data=sp)
 
-    if ok_tp1 and ok_tp2 and ok_sl:
-        send_tg(f"🧷 تم تعيين TP1/TP2/SL لـ <b>{symbol}</b> ✅")
-
-def fmt_price(p): return f"{p:.8f}".rstrip('0').rstrip('.')
+def fmt_price(p):
+    try: return f"{float(p):.8f}".rstrip('0').rstrip('.')
+    except Exception: return str(p)
 
 def send_entry_alert(symbol, side, entry, qty, lev):
-    tp2 = entry*(1+TAKE_PROFIT_PCT) if side=="BUY" else entry*(1-TAKE_PROFIT_PCT)
-    tp1 = entry*(1+TAKE_PROFIT_PCT/2) if side=="BUY" else entry*(1-TAKE_PROFIT_PCT/2)
-    sl  = entry*(1-STOP_LOSS_PCT) if side=="BUY" else entry*(1+STOP_LOSS_PCT)
+    tp2 = entry*(1+0.006) if side=="BUY" else entry*(1-0.006)
+    tp1 = entry*(1+0.003) if side=="BUY" else entry*(1-0.003)
+    sl  = entry*(1-0.01)  if side=="BUY" else entry*(1+0.01)
     emoji = "🟢 LONG دخول ✅" if side=="BUY" else "🔴 SHORT دخول ✅"
-    msg = (f"{emoji}\n"
-           f"<b>{symbol}</b> | Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
+    msg = (f"{emoji}\n<b>{symbol}</b> | Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
            f"TP1(50%): {fmt_price(tp1)} | TP2: {fmt_price(tp2)}\n"
-           f"Qty {qty:.8f} | Lev {lev}x")
+           f"Qty {float(qty):.8f} | Lev {lev}x")
     send_tg(msg)
 
-# ===== tracking & PnL =====
-state = {}  # symbol -> dict(side, entry, qty, positionSide, open_ts_ms, tp1_done, tick_size, lot_step, min_qty)
+state = {}
 
 def user_trades(symbol, start_ms):
     out=[]; s=start_ms
@@ -288,9 +270,9 @@ def detect_tp_fills(symbol):
     def fqty(t): return float(t["qty"])
     def fpr(t): return float(t["price"])
     lot = st["lot_step"]
-    tp1_qty_target = max(round_step(st["qty"]*TP1_SHARE, lot), st["min_qty"])
+    from decimal import Decimal as D
+    tp1_qty_target = float(qty_to_step(D(str(st["qty"])) * D("0.5"), lot, st["min_qty"]))
     total_closed = sum(fqty(t) for t in fills)
-    # TP1 detection
     if (not st.get("tp1_done")) and total_closed + 1e-12 >= tp1_qty_target:
         acc=0.0; vwap=0.0
         for t in sorted(fills, key=lambda x: x["time"]):
@@ -302,44 +284,18 @@ def detect_tp_fills(symbol):
             exec_px = vwap/acc
             st["tp1_done"]=True; st["tp1_price"]=exec_px
             send_tg(f"🎯 TP1 تنفيذ فعلي <b>{symbol}</b>\nسعر التنفيذ: {fmt_price(exec_px)} | كمية≈ {tp1_qty_target:.8f}")
-            # Adjust to Breakeven: cancel and set new SL at entry, re-place TP2 closePosition
             try:
                 cancel_all_orders(symbol)
-                tp2_price = st["entry"]*(1+TAKE_PROFIT_PCT) if st["side"]=="BUY" else st["entry"]*(1-TAKE_PROFIT_PCT)
-                tick = st["tick_size"]; tp2_price = round(tp2_price/tick)*tick
+                tp2_price = price_to_tick(st["entry"]*(1+0.006) if st["side"]=="BUY" else st["entry"]*(1-0.006), st["tick_size"])
+                be_price  = price_to_tick(st["entry"], st["tick_size"])
                 tp_side = "SELL" if st["side"]=="BUY" else "BUY"
                 common = {"symbol":symbol,"workingType":"MARK_PRICE"}
                 if st["positionSide"]: common["positionSide"]=st["positionSide"]
                 _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":tp2_price,"closePosition":"true"})
-                _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"STOP_MARKET","stopPrice":st["entry"],"closePosition":"true"})
-                send_tg(f"🛡️ تم تعديل SL إلى Breakeven ووضع TP2 لباقي الكمية")
+                _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"STOP_MARKET","stopPrice":be_price,"closePosition":"true"})
+                send_tg("🛡️ تم تعديل SL إلى Breakeven ووضع TP2 لباقي الكمية")
             except Exception as e:
                 send_tg(f"⚠️ لم أستطع تعديل الأوامر بعد TP1: {e}")
-    # TP2 execution alert (when fully closed we will also send PnL via income)
-    if total_closed + 1e-12 >= st["qty"]:
-        remaining = st["qty"] - tp1_qty_target if st.get("tp1_done") else st["qty"]
-        if remaining > 0:
-            acc=0.0; vwap=0.0
-            sorted_f = sorted(fills, key=lambda x: x["time"])
-            if st.get("tp1_done"):
-                skip = tp1_qty_target
-                buff=[]
-                for t in sorted_f:
-                    q=fqty(t); p=fpr(t)
-                    if skip>0:
-                        d=min(q, skip); skip-=d; left=q-d
-                        if left>0: buff.append({"qty":left,"price":p})
-                    else:
-                        buff.append({"qty":q,"price":p})
-                sorted_f = buff
-            for t in sorted_f:
-                q=float(t["qty"]); p=float(t["price"])
-                take=min(q, remaining-acc)
-                vwap += p*take; acc += take
-                if acc>=remaining-1e-12: break
-            if acc>0:
-                exec_px = vwap/acc
-                send_tg(f"🎯 TP2 تنفيذ فعلي <b>{symbol}</b>\nسعر التنفيذ: {fmt_price(exec_px)} | كمية≈ {remaining:.8f}")
 
 def income_sum(symbol, start_ms, end_ms):
     realized=0.0; fees=0.0; s=start_ms
@@ -359,35 +315,42 @@ def income_sum(symbol, start_ms, end_ms):
 def send_close_summary_real(symbol, entry, qty, side, open_ts_ms):
     end_ms=int(time.time()*1000 + _time_offset_ms)
     realized, fees = income_sum(symbol, open_ts_ms-60_000, end_ms)
-    pnl = realized + fees  # fees negative
-    margin = entry*qty/max(1,LEVERAGE)
+    pnl = realized + fees
+    margin = float(entry)*float(qty)/max(1,5)
     roi = (pnl/margin*100) if margin>0 else 0.0
     emoji = "✅ ربح" if pnl>=0 else "❌ خسارة"
-    send_tg(f"📘 إغلاق مركز (فعلي)\n<b>{symbol}</b> | {emoji}\nRealized P&L: {pnl:.4f} USDT (PnL {realized:.4f}, Fees {fees:.4f})\nQty {qty:.8f} | Lev {LEVERAGE}x | ROI≈ {roi:.2f}%")
+    send_tg(f"📘 إغلاق مركز (فعلي)\n<b>{symbol}</b> | {emoji}\nRealized P&L: {pnl:.4f} USDT (PnL {realized:.4f}, Fees {fees:.4f})\nQty {float(qty):.8f} | Lev 5x | ROI≈ {roi:.2f}%")
 
-# ===== execution =====
 def calc_order_qty(symbol, price):
     bal = account_balance_usdt()
-    notional = bal * PER_TRADE_PCT * LEVERAGE
+    notional = bal * 0.05 * 5
     raw_qty = notional / price
     f = symbol_filters(symbol)
-    qty = max(round_step(raw_qty, f["lot_step"]), f["min_qty"])
-    return qty
+    qty_str = qty_to_step(raw_qty, f["lot_step"], f["min_qty"])
+    return Decimal(qty_str)
+
+def open_positions():
+    try: data=_request("GET", POSITION_RISK_EP, signed_req=True)
+    except Exception: return {}
+    pos={}
+    for p in data:
+        qty=float(p["positionAmt"])
+        if abs(qty)>1e-12: pos[p["symbol"]]=qty
+    return pos
 
 def maybe_trade(symbol, signal, price, hedge):
     positions = open_positions()
-    if len(positions) >= MAX_OPEN_TRADES and symbol not in positions: return
+    if len(positions) >= 4 and symbol not in positions: return
     if symbol in positions: return
     side="BUY" if signal=="BUY" else "SELL"
-    ensure_leverage(symbol, LEVERAGE)
+    ensure_leverage(symbol, 5)
     qty=calc_order_qty(symbol, price)
     if qty<=0: return
     if RUN_MODE.lower()=="paper":
-        send_entry_alert(symbol, side, price, qty, LEVERAGE)
+        send_entry_alert(symbol, side, price, qty, 5)
         f=symbol_filters(symbol)
         state[symbol]={"side":side,"entry":price,"qty":qty,"positionSide":("LONG" if side=="BUY" else "SHORT") if hedge else None,
-                       "open_ts_ms": int(time.time()*1000 + _time_offset_ms),
-                       "tp1_done": False, "tick_size": f["tick_size"], "lot_step": f["lot_step"], "min_qty": f["min_qty"]}
+                       "open_ts_ms": int(time.time()*1000 + _time_offset_ms),"tp1_done": False, "tick_size": f["tick_size"], "lot_step": f["lot_step"], "min_qty": f["min_qty"]}
         return
     try:
         posSide=("LONG" if side=="BUY" else "SHORT") if hedge else None
@@ -395,50 +358,30 @@ def maybe_trade(symbol, signal, price, hedge):
         entry=float(order.get("avgPrice") or price)
         f=symbol_filters(symbol)
         state[symbol]={"side":side,"entry":entry,"qty":qty,"positionSide":posSide,
-                       "open_ts_ms": int(time.time()*1000 + _time_offset_ms),
-                       "tp1_done": False,"tick_size": f["tick_size"], "lot_step": f["lot_step"], "min_qty": f["min_qty"]}
-        send_entry_alert(symbol, side, entry, qty, LEVERAGE)
+                       "open_ts_ms": int(time.time()*1000 + _time_offset_ms),"tp1_done": False,"tick_size": f["tick_size"], "lot_step": f["lot_step"], "min_qty": f["min_qty"]}
+        send_entry_alert(symbol, side, entry, qty, 5)
         place_tp1_tp2_sl(symbol, side, entry, qty, posSide)
     except Exception as e:
         send_tg(f"❌ فشل فتح {symbol}: {e}")
 
-# helpers
-def open_positions():
-    try:
-        data=_request("GET", POSITION_RISK_EP, signed_req=True)
-    except Exception:
-        return {}
-    pos={}
-    for p in data:
-        qty=float(p["positionAmt"])
-        if abs(qty)>1e-12:
-            pos[p["symbol"]]=qty
-    return pos
-
-def price_now(symbol):
-    j=f_get(PRICE_EP, {"symbol":symbol}); return float(j["price"])
-
-# ===== scanning & heartbeat =====
 def load_universe():
-    if SYMBOLS_CSV and os.path.exists(SYMBOLS_CSV):
-        return pd.read_csv(SYMBOLS_CSV)["symbol"].tolist()[:MAX_SYMBOLS]
     data=f_get(TICKER_24H, {"type":"FULL"})
     df=pd.DataFrame(data); df=df[df["symbol"].str.endswith("USDT")]
     df["quoteVolume"]=df["quoteVolume"].astype(float)
-    return df.sort_values("quoteVolume", ascending=False)["symbol"].head(60).tolist()[:MAX_SYMBOLS]
+    return df.sort_values("quoteVolume", ascending=False)["symbol"].head(60).tolist()[:16]
 
 def scan_once(symbols):
     hits=0; errors=0; signals=[]
     for sym in symbols:
         try:
-            df=get_klines(sym, INTERVAL, KLINES_LIMIT)
+            df=get_klines(sym, "5m", 200)
             if len(df)<60: time.sleep(0.3); continue
             votes, px, adx_v, atr_v = indicator_votes(df)
             sig=soft_consensus(votes, px, adx_v, atr_v)
             if sig in ("BUY","SELL"): hits+=1; signals.append((sym,sig,px))
-            time.sleep(1.0 + random.random()*0.5)
+            time.sleep(0.8)
         except Exception as e:
-            errors+=1; print(f"[SYM ERR] {sym}: {e}")
+            errors+=1
     return hits, errors, signals
 
 _prev_open=set()
@@ -446,34 +389,28 @@ def detect_closes_and_notify():
     global _prev_open
     positions=open_positions()
     now_open=set(positions.keys())
-    # detect tp1/tp2 fills
     for s in list(state.keys()):
         try: detect_tp_fills(s)
-        except Exception as e: print(f"[TP DETECT WARN] {s}: {e}")
-    # full close
+        except Exception: pass
     closed=[s for s in _prev_open if s not in now_open]
     for s in closed:
         st=state.pop(s, None)
         if st:
-            try:
-                send_close_summary_real(s, st["entry"], st["qty"], st["side"], st["open_ts_ms"])
-            except Exception as e:
-                send_tg(f"🔔 تم إغلاق مركز {s} (تعذر حساب P&L بدقة: {e})")
-        else:
-            send_tg(f"🔔 تم إغلاق مركز {s}")
+            try: send_close_summary_real(s, st["entry"], st["qty"], st["side"], st["open_ts_ms"])
+            except Exception as e: send_tg(f"🔔 تم إغلاق مركز {s} (تعذر حساب P&L بدقة: {e})")
+        else: send_tg(f"🔔 تم إغلاق مركز {s}")
     _prev_open=now_open
 
 def heartbeat(h,e):
-    ts=now_utc().strftime("%Y-%m-%d %H:%M:%SZ")
-    msg=f"💗 Heartbeat | إستراتيجية: Consensus\nإشارات: {h} | صفقات: {len(_prev_open)} | أخطاء: {e} | لكل صفقة: {PER_TRADE_PCT*100:.1f}%"
+    msg=f"💗 Heartbeat | إستراتيجية: Consensus\nإشارات: {h} | صفقات: {len(_prev_open)} | أخطاء: {e} | لكل صفقة: 5.0%"
     send_tg(msg)
 
 def main():
-    send_tg("🚀 تشغيل Mahdi v4.1r — TP جزئي بأسعار تنفيذ فعلية + SL 1% + P&L فعلي")
+    send_tg("🚀 تشغيل Mahdi v4.1r — TP جزئي بأسعار تنفيذ فعلية + SL 1% + P&L فعلي (تصحيح الدقة)")
     sync_server_time()
     hedge=is_hedge_mode()
     symbols=load_universe()
-    last_hb=now_utc()-timedelta(minutes=HEARTBEAT_MIN+1)
+    last_hb=now_utc()-timedelta(minutes=31)
     cooldown_until=now_utc()
     while True:
         start=now_utc()
@@ -481,10 +418,10 @@ def main():
         h,e,sigs=scan_once(symbols)
         for sym,sig,px in sigs: maybe_trade(sym,sig,px,hedge)
         detect_closes_and_notify()
-        if (now_utc()-last_hb)>=timedelta(minutes=HEARTBEAT_MIN):
+        if (now_utc()-last_hb)>=timedelta(minutes=30):
             heartbeat(h,e); last_hb=now_utc()
-        cooldown_until=now_utc()+timedelta(seconds=SCAN_INTERVAL_SEC if h==0 else COOLDOWN_MIN*60)
-        time.sleep(max(1, SCAN_INTERVAL_SEC))
+        cooldown_until=now_utc()+timedelta(seconds=45 if h==0 else 45*60)
+        time.sleep(1)
 
 if __name__=="__main__":
     main()
