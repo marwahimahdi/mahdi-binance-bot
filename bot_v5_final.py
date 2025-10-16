@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MahdiBot v5 FINAL — Auto-Scan Mode (Top 30)
-- USDT-M Futures only (PERPETUAL/TRADING)
-- Indicators: EMA(21/50), MACD(12,26,9), RSI(14), Supertrend(10,3), VWAP(50)
-- Filters: ADX>=20, ATR/Close>=0.0025, consensus ratio>=0.65 and min-agree=2
-- Dynamic leverage: 5x normal, 10x strong (ADX>=28 or ratio>=0.80)
-- Position size: 5% normal, 6% strong (total cap limit 40%, max open trades=6)
-- 3 TPs: 0.35% / 0.7% / 1.2% (strong: 0.5% / 1.0% / 1.8%)
-- After TP1: SL -> Breakeven | After TP2: lock profit (+0.20%, strong +0.30%)
-- Kill-switch: stop trading if daily realized PnL <= -5% balance
-- Watchdog: warn after 10 min no-activity + reminder after 30 min, with last-activity
-- Margin: force ISOLATED per symbol (warn if blocked by open orders)
-- Telegram: rich alerts + Heartbeat every 15 min
+MahdiBot v5 FINAL — Auto-Scan Mode (Top N)
+— USDT-M Futures فقط (PERPETUAL/TRADING)
+— مؤشرات: EMA(21/50), MACD(12,26,9), RSI(14), Supertrend(10,3), VWAP(50)
+— فلاتر: ADX>=20, ATR/Close>=0.0025, وإجماع>=0.65 مع MIN_AGREE>=2
+— رافعة ديناميكية: 5x/10x | حجم: 5%/6% (حد رأس المال 40%، أقصى صفقات 6)
+— 3 أهداف: 0.35% / 0.7% / 1.2% (القوية: 0.5% / 1.0% / 1.8%)
+— بعد TP1: SL→Breakeven | بعد TP2: قفل ربح (+0.20% / القوية +0.30%)
+— Kill-Switch يومي عند -5% | Watchdog 10د + تذكير بعد 30د
+— إجبار الهامش ISOLATED، وتنظيف الرموز غير الصالحة تلقائيًا
 """
 
 import os, time, hmac, hashlib, math, requests
@@ -45,6 +42,7 @@ MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES","6"))
 NORMAL_TRADE_PCT  = float(os.getenv("NORMAL_TRADE_PCT","0.05"))
 STRONG_TRADE_PCT  = float(os.getenv("STRONG_TRADE_PCT","0.06"))
 
+# أهداف عادية
 STOP_LOSS_PCT_BASE = float(os.getenv("STOP_LOSS_PCT","0.009"))
 TP1_PCT = float(os.getenv("TP1_PCT","0.0035"))
 TP2_PCT = float(os.getenv("TP2_PCT","0.007"))
@@ -55,22 +53,25 @@ TP3_SHARE = float(os.getenv("TP3_SHARE","0.25"))
 BREAKEVEN_AFTER_TP1 = os.getenv("BREAKEVEN_AFTER_TP1","true").lower() in ("1","true","yes")
 LOCK_AFTER_TP2_PCT  = float(os.getenv("LOCK_AFTER_TP2_PCT","0.002"))  # 0.20%
 
+# أهداف قوية
 STOP_LOSS_PCT_STRONG = float(os.getenv("STOP_LOSS_PCT_STRONG","0.012"))
 TP1_PCT_STRONG = float(os.getenv("TP1_PCT_STRONG","0.005"))
 TP2_PCT_STRONG = float(os.getenv("TP2_PCT_STRONG","0.010"))
 TP3_PCT_STRONG = float(os.getenv("TP3_PCT_STRONG","0.018"))
 TP_SHARES_STRONG = os.getenv("TP_SHARES_STRONG","0.35,0.35,0.30")
 
+# Telegram
 TG_TOKEN  = os.getenv("TELEGRAM_TOKEN","")
 TG_CHATID = os.getenv("TELEGRAM_CHAT_ID","")
 TG_ENABLED = os.getenv("TG_ENABLED","true").lower() in ("1","true","yes")
 TG_NOTIFY_WEAK = os.getenv("TG_NOTIFY_WEAK","false").lower() in ("1","true","yes")
 TG_NOTIFY_UNIVERSE = os.getenv("TG_NOTIFY_UNIVERSE","true").lower() in ("1","true","yes")
 
+# إدارة المخاطرة
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT","0.05"))
-
 DEFAULT_MARGIN_TYPE = os.getenv("MARGIN_TYPE","ISOLATED").upper()
 
+# ============ Endpoints ============
 BASE = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
 KLINES = f"{BASE}/fapi/v1/klines"
 TICKER_24H = f"{BASE}/fapi/v1/ticker/24hr"
@@ -90,7 +91,7 @@ USER_TRADES_EP = f"{BASE}/fapi/v1/userTrades"
 session = requests.Session()
 session.headers.update({"X-MBX-APIKEY": API_KEY, "User-Agent":"MahdiBot/5.0-final"})
 
-# ============ Time & Activity ============
+# ============ Time helpers ============
 try:
     from zoneinfo import ZoneInfo
     TZ_RIYADH = ZoneInfo("Asia/Riyadh")
@@ -114,19 +115,18 @@ def fmt_both_times(ts_utc):
     ts_local = ts_utc.astimezone(TZ_RIYADH)
     return ts_utc.strftime("%Y-%m-%d %H:%M:%S UTC"), ts_local.strftime("%Y-%m-%d %H:%M:%S Asia/Riyadh")
 
-# ============ Helpers ============
+# ============ Utils ============
 def _D(x): return Decimal(str(x))
 def floor_to_step(value, step):
     v=_D(value); s=_D(step)
-    n = (v/s).to_integral_value(rounding=ROUND_DOWN)
-    q = (n*s)
-    if q <= 0: q = s
+    n=(v/s).to_integral_value(rounding=ROUND_DOWN)
+    q=(n*s)
+    if q<=0: q=s
     return str(q.normalize())
 def price_to_tick(price, tick): return floor_to_step(price, tick)
 def qty_to_step(qty, lot_step, min_qty):
-    from decimal import Decimal as D
-    q = D(floor_to_step(qty, lot_step))
-    mq = D(str(min_qty))
+    q=_D(floor_to_step(qty, lot_step))
+    mq=_D(str(min_qty))
     if q < mq: q = mq
     return str(q.normalize())
 
@@ -135,12 +135,12 @@ def send_tg(text):
     if not (TG_ENABLED and TG_TOKEN and TG_CHATID): return
     try:
         session.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                     data={"chat_id": TG_CHATID, "text": text, "parse_mode":"HTML",
-                           "disable_web_page_preview":True}, timeout=10)
+                     data={"chat_id":TG_CHATID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},
+                     timeout=10)
     except Exception as e:
         print(f"[TG ERR] {e}")
 
-# ============ Signing & Requests ============
+# ============ Requests/Signing ============
 _time_offset_ms=0
 def sync_server_time():
     global _time_offset_ms
@@ -170,8 +170,6 @@ def _request(method, url, *, params=None, data=None, signed_req=False, timeout=2
         resp=session.get(u, params=P, timeout=timeout)
     else:
         resp=session.post(url, data=(signed(data) if signed_req else data), timeout=timeout)
-    if resp.status_code in (418,429):  # rate limit / banned
-        time.sleep(3);  # simple backoff
     if resp.status_code>=400:
         try:
             j=resp.json(); code=j.get("code"); msg=j.get("msg")
@@ -202,8 +200,7 @@ def account_balance_usdt():
 
 def is_hedge_mode():
     try:
-        j=_request("GET", DUAL_SIDE_EP, signed_req=True)
-        return bool(j.get("dualSidePosition"))
+        j=_request("GET", DUAL_SIDE_EP, signed_req=True); return bool(j.get("dualSidePosition"))
     except Exception: return False
 
 def ensure_leverage(symbol, lev):
@@ -228,7 +225,7 @@ def ensure_margin_type(symbol, margin_type):
 
 # ============ Market Data ============
 def get_klines(symbol, interval="5m", limit=200):
-    data=f_get(KLINES, {"symbol":symbol, "interval":interval, "limit":limit})
+    data=f_get(KLINES, {"symbol":symbol,"interval":interval,"limit":limit})
     cols=["open_time","open","high","low","close","volume","close_time","q","t","tb","tq","i"]
     df=pd.DataFrame(data, columns=cols)
     for c in ["open","high","low","close","volume"]: df[c]=df[c].astype(float)
@@ -315,7 +312,7 @@ def soft_consensus(votes, adx_v, atr_pct):
 
 # ============ Universe (strict futures) ============
 def fetch_valid_perpetual_usdt():
-    """Return set of symbols that are USDT-M, PERPETUAL, TRADING."""
+    """جلب جميع رموز USDT-M/ PERPETUAL/ TRADING."""
     data = _request("GET", EXCHANGE_INFO, params={}, signed_req=False)
     valid=set()
     for s in data.get("symbols", []):
@@ -330,8 +327,7 @@ def build_auto_universe():
     df=df[df["symbol"].isin(valid)].copy()
     df["quoteVolume"]=df["quoteVolume"].astype(float)
     syms = df.sort_values("quoteVolume", ascending=False)["symbol"].tolist()
-    syms = syms[:MAX_SYMBOLS]
-    return syms
+    return syms[:MAX_SYMBOLS]
 
 def load_universe():
     if SYMBOLS_CSV:
@@ -374,7 +370,7 @@ def send_entry_alert(symbol, side, entry, qty, lev, tps, sl):
             f"TP1:{tps[0]*100:.2f}% | TP2:{tps[1]*100:.2f}% | TP3:{tps[2]*100:.2f}%\n"
             f"Qty {float(qty):.8f} | Lev {lev}x")
 
-# ============ User trades & PnL ============
+# ============ PnL & Trades ============
 def user_trades(symbol, start_ms):
     out=[]; s=start_ms
     while True:
@@ -482,53 +478,67 @@ def place_tp3_sl(symbol, side, entry, qty, posSide, strong):
 
     return tps, tp_prices, sl_pct, sl_price, lock_pct, shares
 
-# ============ TP/SL handling ============
+# ============ TP/SL fills detection (FIXED SYNTAX) ============
 def detect_tp_fills(symbol):
-    st=state.get(symbol); if not st: return
-    start_ms=st["open_ts_ms"]-60_000
-    trades=user_trades(symbol, start_ms)
-    if not trades: return
-    close_side="SELL" if st["side"]=="BUY" else "BUY"
-    fills=[t for t in trades if int(t["time"])>=st["open_ts_ms"] and t.get("side")==close_side]
-    if not fills: return
+    st = state.get(symbol)
+    if not st:
+        return
+
+    start_ms = st["open_ts_ms"] - 60_000
+    trades = user_trades(symbol, start_ms)
+    if not trades:
+        return
+
+    close_side = "SELL" if st["side"] == "BUY" else "BUY"
+    fills = [t for t in trades if int(t["time"]) >= st["open_ts_ms"] and t.get("side") == close_side]
+    if not fills:
+        return
 
     def fqty(t): return float(t["qty"])
     def fpr(t): return float(t["price"])
 
-    lot=st["lot_step"]; minq=st["min_qty"]
+    lot = st["lot_step"]; minq = st["min_qty"]
     from decimal import Decimal as D
-    tp1_target=float(qty_to_step(D(str(st["qty"]))*D(str(st["shares"][0])), lot, minq))
-    tp2_target=float(qty_to_step(D(str(st["qty"]))*D(str(st["shares"][1])), lot, minq))
+    tp1_target = float(qty_to_step(D(str(st["qty"])) * D(str(st["shares"][0])), lot, minq))
+    tp2_target = float(qty_to_step(D(str(st["qty"])) * D(str(st["shares"][1])), lot, minq))
+    total_closed = sum(fqty(t) for t in fills)
 
-    total_closed=sum(fqty(t) for t in fills)
-
-    # TP1
-    if (not st.get("tp1_done")) and total_closed+1e-12 >= tp1_target:
-        acc=0.0; vwap=0.0
+    # ---- TP1 ----
+    if (not st.get("tp1_done")) and total_closed + 1e-12 >= tp1_target:
+        acc = 0.0
+        vwap = 0.0
         for t in sorted(fills, key=lambda x: x["time"]):
-            q=fqty(t); p=fpr(t)
-            take=min(q, tp1_target-acc)
-            vwap += p*take; acc += take
-            if acc >= tp1_target-1e-12: break
-        if acc>0:
-            exec_px=vwap/acc
-            st["tp1_done"]=True; st["tp1_price"]=exec_px
+            q = fqty(t); p = fpr(t)
+            take = min(q, tp1_target - acc)
+            vwap += p * take
+            acc  += take
+            if acc >= tp1_target - 1e-12: break
+        if acc > 0:
+            exec_px = vwap / acc
+            st["tp1_done"] = True
+            st["tp1_price"] = exec_px
             send_tg(f"🎯 TP1 تنفيذ فعلي <b>{symbol}</b>\nسعر التنفيذ: {fmt_price(exec_px)} | كمية≈ {tp1_target:.8f}")
             mark_activity("TP1 filled", f"{symbol} exec≈{fmt_price(exec_px)}")
+
             if BREAKEVEN_AFTER_TP1:
                 try:
                     cancel_all_orders(symbol)
-                    is_buy=(st["side"]=="BUY")
-                    f=symbol_filters(symbol); tick=f["tick_size"]
+                    is_buy = (st["side"] == "BUY")
+                    f = symbol_filters(symbol); tick = f["tick_size"]
+
                     def price_for(pct):
-                        raw=st["entry"]*(1+pct) if is_buy else st["entry"]*(1-pct)
+                        raw = st["entry"] * (1 + pct) if is_buy else st["entry"] * (1 - pct)
                         return price_to_tick(max(raw, float(tick)), tick)
-                    tp2_price=price_for(st["tps"][1]); tp3_price=price_for(st["tps"][2])
-                    be_price=price_to_tick(st["entry"], tick)
-                    tp_side="SELL" if is_buy else "BUY"
-                    common={"symbol":symbol,"workingType":"MARK_PRICE"}
-                    if st["positionSide"]: common["positionSide"]=st["positionSide"]
-                    tp2_qty=qty_to_step(D(str(st["qty"]))*D(str(st["shares"][1])), f["lot_step"], f["min_qty"])
+
+                    tp2_price = price_for(st["tps"][1])
+                    tp3_price = price_for(st["tps"][2])
+                    be_price  = price_to_tick(st["entry"], tick)
+                    tp_side   = "SELL" if is_buy else "BUY"
+                    common = {"symbol": symbol, "workingType": "MARK_PRICE"}
+                    if st["positionSide"]: common["positionSide"] = st["positionSide"]
+
+                    tp2_qty = qty_to_step(D(str(st["qty"])) * D(str(st["shares"][1])), f["lot_step"], f["min_qty"])
+
                     _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":tp2_price,"quantity":tp2_qty,"reduceOnly":"true"})
                     _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":tp3_price,"closePosition":"true"})
                     _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"STOP_MARKET","stopPrice":be_price,"closePosition":"true"})
@@ -536,25 +546,30 @@ def detect_tp_fills(symbol):
                 except Exception as e:
                     send_tg(f"⚠️ لم أستطع تعديل الأوامر بعد TP1: {e}")
 
-    # TP2
-    if st.get("tp1_done") and (not st.get("tp2_done")) and total_closed+1e-12 >= (tp1_target+tp2_target):
-        st["tp2_done"]=True
+    # ---- TP2 ----
+    if st.get("tp1_done") and (not st.get("tp2_done")) and total_closed + 1e-12 >= (tp1_target + tp2_target):
+        st["tp2_done"] = True
         try:
             cancel_all_orders(symbol)
-            is_buy=(st["side"]=="BUY")
-            f=symbol_filters(symbol); tick=f["tick_size"]
+            is_buy = (st["side"] == "BUY")
+            f = symbol_filters(symbol); tick = f["tick_size"]
+
             def price_for(pct):
-                raw=st["entry"]*(1+pct) if is_buy else st["entry"]*(1-pct)
+                raw = st["entry"] * (1 + pct) if is_buy else st["entry"] * (1 - pct)
                 return price_to_tick(max(raw, float(tick)), tick)
-            tp3_price=price_for(st["tps"][2])
-            common={"symbol":symbol,"workingType":"MARK_PRICE"}
-            tp_side="SELL" if is_buy else "BUY"
-            if st["positionSide"]: common["positionSide"]=st["positionSide"]
+
+            tp3_price = price_for(st["tps"][2])
+            common = {"symbol": symbol, "workingType": "MARK_PRICE"}
+            tp_side = "SELL" if is_buy else "BUY"
+            if st["positionSide"]: common["positionSide"] = st["positionSide"]
+
             _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":tp3_price,"closePosition":"true"})
-            lock=price_for(st["lock_pct"] if is_buy else -st["lock_pct"])
-            _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"STOP_MARKET","stopPrice":lock,"closePosition":"true"})
-            send_tg(f"🔒 تم تشديد SL بعد TP2 إلى {'+' if is_buy else '-'}{st['lock_pct']*100:.2f}% من الدخول")
-            mark_activity("TP2 filled", f"{symbol} lock={st['lock_pct']*100:.2f}%")
+
+            lock_pct = st["lock_pct"]
+            lock_price = price_for(lock_pct if is_buy else -lock_pct)
+            _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"STOP_MARKET","stopPrice":lock_price,"closePosition":"true"})
+            send_tg(f"🔒 تم تشديد SL بعد TP2 إلى {'+' if is_buy else '-'}{lock_pct*100:.2f}% من الدخول")
+            mark_activity("TP2 filled", f"{symbol} lock={lock_pct*100:.2f}%")
         except Exception as e:
             send_tg(f"⚠️ لم أستطع تشديد SL بعد TP2: {e}")
 
@@ -597,7 +612,7 @@ def detect_closes_and_notify():
     global _prev_open
     positions=open_positions()
     now_open=set(positions.keys())
-    # detect TPs
+    # detect TP fills
     for s in list(state.keys()):
         try: detect_tp_fills(s)
         except Exception: pass
@@ -620,7 +635,7 @@ def heartbeat(h,e,open_n, cap_used_pct):
 
 def capital_usage_pct():
     n=len(_prev_open)
-    return min(100.0, n*6.0)  # تقريب
+    return min(100.0, n*6.0)  # تقديري
 
 def maybe_trade(symbol, signal, price, adx_v, strength, hedge):
     positions=open_positions()
@@ -630,11 +645,9 @@ def maybe_trade(symbol, signal, price, adx_v, strength, hedge):
     strong=(adx_v>=28 or strength>=0.80)
     lev = 10 if strong else 5
 
-    # live price
     price=get_live_price(symbol)
     if not price or price<=0: return
 
-    # margin/leverage
     try:
         ensure_margin_type(symbol, DEFAULT_MARGIN_TYPE)
     except Exception: pass
@@ -643,7 +656,6 @@ def maybe_trade(symbol, signal, price, adx_v, strength, hedge):
     qty=calc_order_qty(symbol, price, lev, strong)
     if qty<=0: return
 
-    # targets setup
     if strong:
         tps=(TP1_PCT_STRONG, TP2_PCT_STRONG, TP3_PCT_STRONG)
         try: s1,s2,s3=[float(x.strip()) for x in TP_SHARES_STRONG.split(",")]
@@ -657,11 +669,12 @@ def maybe_trade(symbol, signal, price, adx_v, strength, hedge):
     posSide=("LONG" if side=="BUY" else "SHORT") if hedge else None
 
     if RUN_MODE.lower() in ("paper","analysis"):
+        f=symbol_filters(symbol)
         state[symbol]={"side":side,"entry":price,"qty":qty,"positionSide":posSide,
                        "open_ts_ms":int(time.time()*1000 + _time_offset_ms),
                        "tp1_done":False,"tp2_done":False,
-                       "tick_size":symbol_filters(symbol)["tick_size"], "lot_step":symbol_filters(symbol)["lot_step"],
-                       "min_qty":symbol_filters(symbol)["min_qty"], "tps":tps, "shares":shares,
+                       "tick_size":f["tick_size"], "lot_step":f["lot_step"],
+                       "min_qty":f["min_qty"], "tps":tps, "shares":shares,
                        "lock_pct":lock_pct, "leverage":lev}
         sl_price = price*(1-sl_pct) if side=="BUY" else price*(1+sl_pct)
         send_entry_alert(symbol, side, price, qty, lev, tps, sl_price)
@@ -734,8 +747,8 @@ def main():
     mark_activity("Startup", f"mode={RUN_MODE}, testnet={USE_TESTNET}")
     sync_server_time()
     hedge=is_hedge_mode()
-    symbols=load_universe()  # صارمة USDT-M PERPETUAL
-    # pre-set margin type best effort
+    symbols=load_universe()
+    # إجبار الهامش المعزول قدر الإمكان عند الإقلاع
     for s in symbols:
         try: ensure_margin_type(s, DEFAULT_MARGIN_TYPE); time.sleep(0.03)
         except Exception: pass
@@ -751,8 +764,7 @@ def main():
 
             h,e,sigs=scan_once(symbols)
             for sym,sig,px,adx_v,strength in sigs:
-                # dynamic acceptance (ignore weak if chosen)
-                if adx_v<20 or strength<0.65:
+                if adx_v<ADX_MIN or strength<CONSENSUS_RATIO:
                     if TG_NOTIFY_WEAK:
                         send_tg(f"⚠️ تجاهل {sym}: إشارة ضعيفة (ADX {adx_v:.1f}, Ratio {strength:.2f})")
                     continue
