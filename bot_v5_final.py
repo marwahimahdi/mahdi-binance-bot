@@ -29,6 +29,9 @@ MAX_SYMBOLS       = int(os.getenv("MAX_SYMBOLS","30"))
 SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC","75"))
 COOLDOWN_MIN      = int(os.getenv("COOLDOWN_MIN","15"))
 KLINES_LIMIT      = int(os.getenv("KLINES_LIMIT","200"))
+# معدل تلطيف الطلبات لتفادي حظر 418/429 من Binance
+REST_BACKOFF_BASE = float(os.getenv("REST_BACKOFF_BASE", "0.35"))  # ثوانٍ
+REST_BACKOFF_MAX  = float(os.getenv("REST_BACKOFF_MAX",  "8"))     # حد أقصى للنوم التلقائي
 HEARTBEAT_MIN     = int(os.getenv("TG_HEARTBEAT_MIN","15"))
 SYMBOLS_CSV       = os.getenv("SYMBOLS_CSV","")  # اتركه فارغًا للوضع التلقائي
 
@@ -159,24 +162,56 @@ def signed(params:dict):
     sig=hmac.new(API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
     return q+f"&signature={sig}"
 
+import random
+
 def _request(method, url, *, params=None, data=None, signed_req=False, timeout=20):
     if params is None: params={}
     if data is None: data={}
-    if method=="GET":
-        if signed_req:
-            u=url+"?"+signed(params); P=None
-        else:
-            u=url; P=params
-        resp=session.get(u, params=P, timeout=timeout)
-    else:
-        resp=session.post(url, data=(signed(data) if signed_req else data), timeout=timeout)
-    if resp.status_code>=400:
+    attempt = 0
+    backoff = REST_BACKOFF_BASE
+
+    while True:
         try:
-            j=resp.json(); code=j.get("code"); msg=j.get("msg")
-            raise requests.HTTPError(f"{resp.status_code} [{code}] {msg}", response=resp)
-        except ValueError:
-            resp.raise_for_status()
-    return resp.json()
+            if method == "GET":
+                if signed_req:
+                    u = url + "?" + signed(params); P = None
+                else:
+                    u = url; P = params
+                resp = session.get(u, params=P, timeout=timeout)
+            else:
+                payload = signed(data) if signed_req else data
+                resp = session.post(url, data=payload, timeout=timeout)
+
+            # 418/429 = حظر/ضغط — نطبّق باك أوف ونكرّر
+            if resp.status_code in (418, 429):
+                attempt += 1
+                try:
+                    j = resp.json(); code = j.get("code"); msg = j.get("msg","")
+                except Exception:
+                    code = None; msg = ""
+                if attempt == 3:
+                    send_tg(f"⏳ Binance ضغط/حظر مؤقت ({resp.status_code} [{code}] {msg}). سيتم تخفيف الطلبات وإعادة المحاولة تلقائيًا.")
+                sleep_s = min(REST_BACKOFF_MAX, backoff * (1.7 ** attempt)) + random.uniform(0, 0.3)
+                time.sleep(sleep_s)
+                continue
+
+            if resp.status_code >= 400:
+                try:
+                    j = resp.json(); code = j.get("code"); msg = j.get("msg")
+                    raise requests.HTTPError(f"{resp.status_code} [{code}] {msg}", response=resp)
+                except ValueError:
+                    resp.raise_for_status()
+
+            return resp.json()
+
+        except requests.Timeout:
+            attempt += 1
+            time.sleep(min(REST_BACKOFF_MAX, backoff * (1.5 ** attempt)) + random.uniform(0, 0.2))
+            continue
+        except requests.ConnectionError:
+            attempt += 1
+            time.sleep(min(REST_BACKOFF_MAX, backoff * (1.5 ** attempt)) + random.uniform(0, 0.2))
+            continue
 
 def f_get(url, params): return _request("GET", url, params=params)
 
