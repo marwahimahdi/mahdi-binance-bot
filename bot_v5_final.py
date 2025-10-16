@@ -788,6 +788,13 @@ def watchdog_check():
 
 # ============ Main ============
 def main():
+print(f"[BOOT] TG_ENABLED={TG_ENABLED} CHAT_ID={TG_CHATID} TOKEN_LEN={len(TG_TOKEN) if TG_TOKEN else 0}")
+try:
+    r = session.get(f"https://api.telegram.org/bot{TG_TOKEN}/getMe", timeout=10)
+    print(f"[BOOT] getMe -> {r.status_code} {r.text[:120]}")
+except Exception as e:
+    print(f"[BOOT] getMe EXC {e}")
+send_tg("♻️ اختبار اتصال تليجرام — بدء تشغيل Mahdi v5")
     send_tg(f"🚀 تشغيل Mahdi v5 — وضع: {RUN_MODE} | Testnet: {'On' if USE_TESTNET else 'Off'}")
     send_tg(f"🔄 Auto-Scan Mode (Top {MAX_SYMBOLS})\n🧩 فحص كل {SCAN_INTERVAL_SEC} ث | حد أقصى {MAX_OPEN_TRADES} صفقات | رافعة 5-10× ديناميكية")
     mark_activity("Startup", f"mode={RUN_MODE}, testnet={USE_TESTNET}")
