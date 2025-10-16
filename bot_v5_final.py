@@ -417,13 +417,31 @@ state = {}
 _prev_open=set()
 
 # ========= Universe =========
+
+def validate_symbols(symbols):
+    """Return only symbols that exist on USDT-M Futures; warn on invalid ones."""
+    try:
+        data = f_get(EXCHANGE_INFO, {"symbol": None})  # full list
+        valid = set(s["symbol"] for s in data["symbols"])
+    except Exception:
+        return symbols
+    out = []
+    bad = []
+    for s in symbols:
+        if s in valid:
+            out.append(s)
+        else:
+            bad.append(s)
+    if bad:
+        send_tg("⚠️ تم حذف أزواج غير متاحة على العقود الدائمة: " + ", ".join(bad))
+    return out
 def load_universe():
     syms=None
     if SYMBOLS_CSV and os.path.exists(SYMBOLS_CSV):
         try:
             df=pd.read_csv(SYMBOLS_CSV)
             syms=[s.strip().upper() for s in df["symbol"].tolist() if s.upper().endswith("USDT")]
-            syms=syms[:MAX_SYMBOLS]
+            syms=validate_symbols(syms)[:MAX_SYMBOLS]
             if TG_NOTIFY_UNIVERSE:
                 send_tg(f"📊 Universe ثابت: {', '.join(syms[:10])}... (n={len(syms)})")
             return syms
@@ -433,6 +451,7 @@ def load_universe():
     df=pd.DataFrame(data); df=df[df["symbol"].str.endswith("USDT")]
     df["quoteVolume"]=df["quoteVolume"].astype(float)
     syms=df.sort_values("quoteVolume", ascending=False)["symbol"].head(60).tolist()[:MAX_SYMBOLS]
+    syms=validate_symbols(syms)
     if TG_NOTIFY_UNIVERSE:
         send_tg(f"📊 Universe تلقائي (Top Volume): {', '.join(syms[:10])}... (n={len(syms)})")
     return syms
@@ -744,7 +763,7 @@ def check_daily_pnl_limit():
     if _daily_loss_triggered: return True
     bal = account_balance_usdt()
     end_ms = int(time.time()*1000 + _time_offset_ms)
-    start_of_day = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start_ms = int(start_of_day.timestamp()*1000)
     realized, fees = income_sum("", start_ms, end_ms)
     total_pnl = realized + fees
