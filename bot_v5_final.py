@@ -135,13 +135,24 @@ def qty_to_step(qty, lot_step, min_qty):
 
 # ============ Telegram ============
 def send_tg(text):
-    if not (TG_ENABLED and TG_TOKEN and TG_CHATID): return
+    if not (TG_ENABLED and TG_TOKEN and TG_CHATID):
+        print(f"[TG SKIP] enabled={TG_ENABLED} token={bool(TG_TOKEN)} chat_id={TG_CHATID}")
+        return
     try:
-        session.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                     data={"chat_id":TG_CHATID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},
-                     timeout=10)
+        r = session.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": TG_CHATID, "text": text, "parse_mode": "HTML",
+                  "disable_web_page_preview": True},
+            timeout=10
+        )
+        if r.status_code >= 400:
+            # اطبع الخطأ بوضوح
+            try:
+                print(f"[TG ERR] {r.status_code} {r.json()}")
+            except Exception:
+                print(f"[TG ERR] {r.status_code} {r.text[:200]}")
     except Exception as e:
-        print(f"[TG ERR] {e}")
+        print(f"[TG EXC] {e}")
 
 # ============ Requests/Signing ============
 _time_offset_ms=0
