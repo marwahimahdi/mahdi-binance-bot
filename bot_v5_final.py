@@ -421,7 +421,7 @@ _prev_open=set()
 def validate_symbols(symbols):
     """Return only symbols that exist on USDT-M Futures; warn on invalid ones."""
     try:
-        data = f_get(EXCHANGE_INFO, {"symbol": None})  # full list
+        data = _request("GET", EXCHANGE_INFO, params={}, signed_req=False)  # full list
         valid = set(s["symbol"] for s in data["symbols"])
     except Exception:
         return symbols
@@ -637,16 +637,31 @@ def send_close_summary_real(symbol, entry, qty, side, open_ts_ms, leverage):
 # ========= Trading loop helpers =========
 def scan_once(symbols):
     hits=0; errors=0; signals=[]
-    for sym in symbols:
+    to_remove=[]
+    for sym in list(symbols):
         try:
             df=get_klines(sym, INTERVAL, KLINES_LIMIT)
-            if len(df)<60: time.sleep(0.2); continue
+            if len(df)<60:
+                time.sleep(0.2); continue
             votes, px, adx_v, atr_v, atr_pct = indicator_votes(df)
             sig, strength = soft_consensus(votes, px, adx_v, atr_pct)
-            if sig in ("BUY","SELL"): hits+=1; signals.append((sym,sig,px,adx_v,strength))
+            if sig in ("BUY","SELL"):
+                hits+=1; signals.append((sym,sig,px,adx_v,strength))
             time.sleep(0.5)
-        except Exception as e:
+        except requests.HTTPError as he:
+            msg=str(he)
+            if "-1121" in msg or "Invalid symbol" in msg:
+                to_remove.append(sym)
             errors+=1
+        except Exception:
+            errors+=1
+    if to_remove:
+        for s in to_remove:
+            try:
+                symbols.remove(s)
+            except ValueError:
+                pass
+        send_tg("⚠️ تمت إزالة أزواج غير صالحة أثناء المسح: " + ", ".join(to_remove))
     return hits, errors, signals
 
 def detect_closes_and_notify():
