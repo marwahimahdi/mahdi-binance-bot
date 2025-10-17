@@ -67,7 +67,7 @@ TG_TOKEN  = os.getenv("TELEGRAM_TOKEN","")
 TG_CHATID = os.getenv("TELEGRAM_CHAT_ID","")
 TG_ENABLED = os.getenv("TG_ENABLED","true").lower() in ("1","true","yes")
 TG_NOTIFY_WEAK = os.getenv("TG_NOTIFY_WEAK","false").lower() in ("1","true","yes")
-TG_NOTIFY_UNIVERSE = os.getenv("TG_NOTIFY_UNIVERSE","true").lower() in ("1","true","yes")
+TG_NOTIFY_UNIVERSE = os.getenv("TG_NOTIFY_UNIVERSE","false").lower() in ("1","true","yes")  # <— افتراضيًا False لمنع الإرسال المبكر
 
 # Risk
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT","0.05"))
@@ -77,9 +77,9 @@ DEFAULT_MARGIN_TYPE  = os.getenv("MARGIN_TYPE","ISOLATED").upper()
 REST_BACKOFF_BASE = float(os.getenv("REST_BACKOFF_BASE", "0.35"))
 REST_BACKOFF_MAX  = float(os.getenv("REST_BACKOFF_MAX",  "8"))
 
-# Universe cache (نعطّله مؤقتًا لحل مشكلة الرموز)
+# Universe cache (نعطّله مؤقتًا)
 CACHE_PATH = pathlib.Path("/tmp/mahdi_valid_syms.json")
-CACHE_TTL_SEC = 0  # <— كان 24*60*60، الآن معطّل
+CACHE_TTL_SEC = 0  # كان 86400
 
 # ========= Endpoints =========
 BASE = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
@@ -341,7 +341,6 @@ def soft_consensus(votes, adx_v, atr_pct):
 
 # ========= Universe (strict USDT-M PERP) =========
 def fetch_valid_perpetual_usdt():
-    # Cache daily (معطل الآن إن كان CACHE_TTL_SEC=0)
     try:
         if CACHE_TTL_SEC>0 and CACHE_PATH.exists():
             j = json.loads(CACHE_PATH.read_text())
@@ -365,17 +364,16 @@ def fetch_valid_perpetual_usdt():
     return valid
 
 def build_auto_universe():
-    """Top-N by 24h quote volume (USDT-M PERP only) + pre-validate on futures price endpoint."""
+    """Top-N by 24h quote volume (USDT-M PERP only) + pre-validate on futures price endpoint.
+       لا ترسل أي رسائل هنا — الإرسال سيكون بعد التحقق النهائي في main()."""
     valid = fetch_valid_perpetual_usdt()
     tickers = f_get(TICKER_24H, {"type": "FULL"})
     df = pd.DataFrame(tickers)
     df = df[df["symbol"].isin(valid)].copy()
     if df.empty:
-        send_tg("⚠️ لم أستطع بناء Universe تلقائي (قائمة فارغة بعد الفلترة). سأجرّب لاحقًا.")
         return []
     df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce").fillna(0.0)
     candidates = df.sort_values("quoteVolume", ascending=False)["symbol"].tolist()
-    # Pre-validate to avoid [-1121]
     final = []
     for s in candidates:
         if len(final) >= MAX_SYMBOLS: break
@@ -386,15 +384,8 @@ def build_auto_universe():
         except requests.HTTPError as he:
             if "-1121" in str(he) or "Invalid symbol" in str(he):
                 continue
-            else:
-                continue
         except Exception:
             continue
-    if TG_NOTIFY_UNIVERSE:
-        if final:
-            send_tg(f"🔄 Auto-Scan Mode (Top {MAX_SYMBOLS})\n📊 Universe: {', '.join(final[:10])}... (n={len(final)})")
-        else:
-            send_tg("⚠️ تعذر التحقق من أي رمز صالح للعقود — ربما ضغط API. سأحاول لاحقًا.")
     return final
 
 def load_universe():
@@ -407,8 +398,6 @@ def load_universe():
             syms = []
         valid = fetch_valid_perpetual_usdt()
         final = [s for s in syms if s in valid][:MAX_SYMBOLS]
-        if TG_NOTIFY_UNIVERSE:
-            send_tg(f"📊 Universe ثابت: {', '.join(final[:10])}... (n={len(final)})")
         return final
     return build_auto_universe()
 
@@ -811,6 +800,13 @@ def main():
     if invalids:
         send_tg("⚠️ تم حذف أزواج غير متاحة على العقود: " + ", ".join(invalids))
     symbols = validated
+
+    # رسالة Universe النهائية فقط بعد التحقق:
+    if symbols:
+        preview = ", ".join(symbols[:10])
+        send_tg(f"📊 Universe النهائي (بعد التحقق): {preview}... (n={len(symbols)})")
+    else:
+        send_tg("⚠️ بعد التحقق لم يتبقَّ أي زوج صالح، سأعيد المحاولة لاحقًا.")
     # ----------------------------------------------------------------
 
     # force isolated as best-effort
@@ -821,7 +817,7 @@ def main():
         except Exception:
             pass
 
-    # Warm-up: first minute scan 10 symbols only to reduce initial load
+    # Warm-up: first minute scan 10 symbols only
     warmup_until = now_utc() + timedelta(minutes=1)
     initial_subset = symbols[:10]
 
