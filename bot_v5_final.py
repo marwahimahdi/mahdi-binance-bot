@@ -218,6 +218,13 @@ def _request(method, url, *, params=None, data=None, signed_req=False, timeout=2
             time.sleep(min(REST_BACKOFF_MAX, backoff*(1.5**attempt)) + random.uniform(0,0.2))
             continue
 
+def get_price(symbol: str) -> float:
+    """يرجع آخر سعر Spot/Last trade للسيمبول (Binance Futures USDT-M)."""
+    s = normalize_symbol(symbol)
+    r = _request("GET", PRICE_EP, params={"symbol": s})
+    j = r.json()
+    return float(j["price"])
+
 def f_get(url, params): return _request("GET", url, params=params)
 
 # ========= Exchange/Account =========
@@ -262,12 +269,15 @@ def ensure_margin_type(symbol, margin_type):
         print(f"[MARGIN WARN] {symbol}: {e}")
 
 # ========= Market Data & Indicators =========
-def get_klines(symbol, interval="5m", limit=200):
-    data=f_get(KLINES, {"symbol":symbol,"interval":interval,"limit":limit})
-    cols=["open_time","open","high","low","close","volume","close_time","q","t","tb","tq","i"]
-    df=pd.DataFrame(data, columns=cols)
-    for c in ["open","high","low","close","volume"]: df[c]=df[c].astype(float)
-    return df
+def get_klines(sym, interval, limit):
+    sym = normalize_symbol(sym)  # << مهم جداً
+    r = _request("GET", KLINES_EP, params={"symbol": sym, "interval": interval, "limit": limit})
+    data = r.json()
+    out = []
+    for row in data:
+        out.append((int(row[0]), float(row[4])))   # time, close
+    return out
+
 
 def get_live_price(symbol):
     j=f_get(PRICE_EP, {"symbol":symbol})
