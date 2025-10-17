@@ -77,9 +77,9 @@ DEFAULT_MARGIN_TYPE  = os.getenv("MARGIN_TYPE","ISOLATED").upper()
 REST_BACKOFF_BASE = float(os.getenv("REST_BACKOFF_BASE", "0.35"))
 REST_BACKOFF_MAX  = float(os.getenv("REST_BACKOFF_MAX",  "8"))
 
-# Universe cache (24h)
+# Universe cache (نعطّله مؤقتًا لحل مشكلة الرموز)
 CACHE_PATH = pathlib.Path("/tmp/mahdi_valid_syms.json")
-CACHE_TTL_SEC = 24*60*60
+CACHE_TTL_SEC = 0  # <— كان 24*60*60، الآن معطّل
 
 # ========= Endpoints =========
 BASE = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
@@ -341,9 +341,9 @@ def soft_consensus(votes, adx_v, atr_pct):
 
 # ========= Universe (strict USDT-M PERP) =========
 def fetch_valid_perpetual_usdt():
-    # Cache daily
+    # Cache daily (معطل الآن إن كان CACHE_TTL_SEC=0)
     try:
-        if CACHE_PATH.exists():
+        if CACHE_TTL_SEC>0 and CACHE_PATH.exists():
             j = json.loads(CACHE_PATH.read_text())
             if time.time() - j.get("ts", 0) < CACHE_TTL_SEC:
                 return set(j.get("symbols", []))
@@ -358,7 +358,8 @@ def fetch_valid_perpetual_usdt():
         and s.get("contractType") == "PERPETUAL"
     }
     try:
-        CACHE_PATH.write_text(json.dumps({"ts": time.time(), "symbols": sorted(valid)}))
+        if CACHE_TTL_SEC>0:
+            CACHE_PATH.write_text(json.dumps({"ts": time.time(), "symbols": sorted(valid)}))
     except Exception:
         pass
     return valid
@@ -794,6 +795,23 @@ def main():
     sync_server_time()
     hedge=is_hedge_mode()
     symbols=load_universe()
+
+    # ---- فحص نهائي لمنع أي رمز غير صالح نهائيًا (يمنع [-1121]) ----
+    validated, invalids = [], []
+    for s in symbols:
+        try:
+            _ = f_get(PRICE_EP, {"symbol": s})  # futures price endpoint
+            validated.append(s)
+            time.sleep(0.01)
+        except requests.HTTPError as he:
+            if "-1121" in str(he) or "Invalid symbol" in str(he):
+                invalids.append(s)
+        except Exception:
+            invalids.append(s)
+    if invalids:
+        send_tg("⚠️ تم حذف أزواج غير متاحة على العقود: " + ", ".join(invalids))
+    symbols = validated
+    # ----------------------------------------------------------------
 
     # force isolated as best-effort
     for s in symbols:
