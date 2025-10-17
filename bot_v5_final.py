@@ -360,30 +360,48 @@ def fetch_valid_perpetual_usdt():
     return valid
 
 def build_auto_universe():
+    """Top-N by 24h quote volume (USDT-M PERP only) + pre-validate on futures price endpoint."""
     valid = fetch_valid_perpetual_usdt()
-    tickers = f_get(TICKER_24H, {"type":"FULL"})
-    df=pd.DataFrame(tickers)
-    df=df[df["symbol"].isin(valid)].copy()
-    df["quoteVolume"]=df["quoteVolume"].astype(float)
-    syms=df.sort_values("quoteVolume", ascending=False)["symbol"].tolist()
-    return syms[:MAX_SYMBOLS]
+    tickers = f_get(TICKER_24H, {"type": "FULL"})
+    df = pd.DataFrame(tickers)
+    # احتفظ فقط بما هو في قائمة العقود الدائمة USDT-M
+    df = df[df["symbol"].isin(valid)].copy()
 
-def load_universe():
-    if SYMBOLS_CSV:
-        if os.path.exists(SYMBOLS_CSV):
-            df=pd.read_csv(SYMBOLS_CSV)
-            syms=[s.strip().upper() for s in df["symbol"] if s.upper().endswith("USDT")]
-        else:
-            syms=[]
-        valid=fetch_valid_perpetual_usdt()
-        final=[s for s in syms if s in valid][:MAX_SYMBOLS]
-        if TG_NOTIFY_UNIVERSE:
-            send_tg(f"📊 Universe ثابت: {', '.join(final[:10])}... (n={len(final)})")
-        return final
-    syms=build_auto_universe()
+    if df.empty:
+        # احتياط: لو لأي سبب صارت القائمة فارغة، لا نعيد رموز عشوائية
+        send_tg("⚠️ لم أستطع بناء Universe تلقائي (قائمة فارغة بعد الفلترة). سأجرّب لاحقًا.")
+        return []
+
+    # ترتيب حسب الحجم
+    df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce").fillna(0.0)
+    candidates = df.sort_values("quoteVolume", ascending=False)["symbol"].tolist()
+
+    # ✅ تحقّق مسبق على واجهة الأسعار الخاصة بالعقود (يمنع [-1121])
+    final = []
+    for s in candidates:
+        if len(final) >= MAX_SYMBOLS:
+            break
+        try:
+            _ = f_get(PRICE_EP, {"symbol": s})    # لو فشل هنا فهو ليس Futures صالح
+            final.append(s)
+            time.sleep(0.02)  # تهدئة خفيفة
+        except requests.HTTPError as he:
+            if "-1121" in str(he) or "Invalid symbol" in str(he):
+                # تجاهل الرمز بصمت
+                continue
+            else:
+                # أخطاء أخرى: ما نوقف الاختيار، نكمل
+                continue
+        except Exception:
+            continue
+
     if TG_NOTIFY_UNIVERSE:
-        send_tg(f"🔄 Auto-Scan Mode (Top {MAX_SYMBOLS})\n📊 Universe: {', '.join(syms[:10])}... (n={len(syms)})")
-    return syms
+        if final:
+            send_tg(f"🔄 Auto-Scan Mode (Top {MAX_SYMBOLS})\n📊 Universe: {', '.join(final[:10])}... (n={len(final)})")
+        else:
+            send_tg("⚠️ تعذر التحقق من أي رمز صالح للعقود — ربما ضغط API. سأحاول لاحقًا.")
+    return final
+
 
 # ========= Orders/TP-SL =========
 def place_market(symbol, side, qty, positionSide=None):
