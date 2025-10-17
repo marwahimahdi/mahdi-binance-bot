@@ -1,305 +1,347 @@
-
 # -*- coding: utf-8 -*-
-'''
-Mahdi v5 PRO — full live script (Binance USDT‑M Futures)
+"""
+Mahdi v5 PRO — Final
+Lightweight Binance Futures bot for Render (no pandas/numpy).
+(see in-file docstring for details)
+"""
+import os, time, hmac, hashlib, requests, math, csv, json
+from datetime import datetime, timezone
 
-What this file does
--------------------
-- Loads environment variables (see section "ENV Vars" below).
-- Reads symbols list from a CSV file (SYMBOLS_CSV), one symbol per line, e.g. BTCUSDT.
-- Caches exchange filters (tickSize / stepSize) and provides helpers to normalize price/qty.
-- Ensures leverage is set once per symbol.
-- Opens MARKET positions and immediately places exit brackets:
-  * TAKE_PROFIT_MARKET with closePosition=true, reduceOnly=true
-  * STOP_MARKET with closePosition=true, reduceOnly=true
-  (Both use workingType="CONTRACT_PRICE".)
-- Minimal Telegram notifications (optional).
+def env(name, default=None, cast=str):
+    v = os.getenv(name, default)
+    if v is None:
+        return None
+    if cast is bool:
+        return str(v).lower() in ("1","true","yes","y")
+    if cast is int:
+        try:
+            return int(str(v).strip())
+        except:
+            return int(float(str(v).strip()))
+    if cast is float:
+        return float(str(v).strip())
+    return str(v).strip()
 
-✅ Works with python-binance 1.0.19
+API_KEY         = env("API_KEY","")
+API_SECRET      = env("API_SECRET","")
+BASE_HOST       = "https://testnet.binancefuture.com" if env("USE_TESTNET","false",bool) else "https://fapi.binance.com"
 
-ENV Vars (set on Render -> Environment)
----------------------------------------
-API_KEY=your_key
-API_SECRET=your_secret
+RUN_MODE        = env("RUN_MODE","paper")
+CAPITAL_USE_PCT = env("CAPITAL_USE_PCT","0.40", float)
+TOTAL_CAPITAL_PCT = env("TOTAL_CAPITAL_PCT", str(CAPITAL_USE_PCT), float)
+MAX_OPEN_TRADES = env("MAX_OPEN_TRADES","6", int)
+MAX_OPEN_POS    = env("MAX_OPEN_POS", str(MAX_OPEN_TRADES), int)
+MAX_SYMBOLS     = env("MAX_SYMBOLS","15", int)
+INTERVAL        = env("INTERVAL","5m")
+INTERVAL_CONFIRM= env("INTERVAL_CONFIRM","15m")
+KLINES_LIMIT    = env("KLINES_LIMIT","300", int)
+SCAN_INTERVAL   = env("SCAN_INTERVAL_SEC","120", int)
 
-RUN_MODE=live              # live (default)
-USE_TESTNET=false          # true to use testnet endpoints
+SLOT_A_PCT      = env("SLOT_A_PCT","0.06", float)
+SLOT_B_PCT      = env("SLOT_B_PCT","0.05", float)
+SLOT_A_LEV      = env("SLOT_A_LEV","10", int)
+SLOT_B_LEV      = env("SLOT_B_LEV","5", int)
 
-SYMBOLS_CSV=universe.csv   # one symbol per line
-TOTAL_CAPITAL_PCT=0.40
-MAX_OPEN_TRADES=6
+TP1_PCT         = env("TP1_PCT","0.0035", float)
+TP2_PCT         = env("TP2_PCT","0.0070", float)
+TP3_PCT         = env("TP3_PCT","0.0120", float)
+SL_PCT          = env("SL_PCT","0.0075", float)
 
-SLOT_A_PCT=0.06            # portion of total capital to use per trade
-SLOT_A_LEV=10              # leverage to set and use
+CONSENSUS_MIN   = env("CONSENSUS_MIN","0.60", float)
+ADX_MIN         = env("ADX_MIN","20", float)
+COOLDOWN_MIN    = env("COOLDOWN_MIN","60", int)
 
-TP1_PCT=0.0035             # +0.35% target
-SL_PCT=0.0075              # -0.75% stop
+TG_ENABLED      = env("TG_ENABLED","true", bool)
+TELEGRAM_TOKEN  = env("TELEGRAM_TOKEN","")
+TELEGRAM_CHAT_ID= env("TELEGRAM_CHAT_ID","")
+TG_HEARTBEAT_MIN= env("TG_HEARTBEAT_MIN","15", int)
+TG_NOTIFY_UNIVERSE = env("TG_NOTIFY_UNIVERSE","false", bool)
+TG_SUMMARY_MIN  = env("TG_SUMMARY_MIN","1440", int)
 
-TG_ENABLED=true
-TELEGRAM_TOKEN=xxxxx
-TELEGRAM_CHAT_ID=xxxxxx
+MARGIN_TYPE     = env("MARGIN_TYPE","ISOLATED")
+SYMBOLS_CSV     = env("SYMBOLS_CSV","universe.csv")
 
-Start on Render
----------------
-Start command:
-    python -u bot_v5_final.py
-'''
-import math
-import os
-import sys
-import time
-import json
-from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Any, List, Optional
+session = requests.Session()
+if API_KEY:
+    session.headers.update({"X-MBX-APIKEY": API_KEY})
 
-import requests
-from binance.client import Client
-from binance.enums import SIDE_BUY, SIDE_SELL, FUTURE_ORDER_TYPE_MARKET
+def ts():
+    return int(time.time()*1000)
 
-# -------------------- Utilities --------------------
+def sign(params: dict) -> dict:
+    query = "&".join([f"{k}={params[k]}" for k in sorted(params)])
+    signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    params["signature"] = signature
+    return params
 
-def getenv_bool(key: str, default: bool=False) -> bool:
-    v = os.getenv(key, str(default)).strip().lower()
-    return v in ("1", "true", "yes", "on")
+def get(path, params=None):
+    url = BASE_HOST + path
+    r = session.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-def getenv_float(key: str, default: float) -> float:
+def post(path, params=None):
+    url = BASE_HOST + path
+    r = session.post(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def err_text(e):
     try:
-        return float(os.getenv(key, default))
-    except Exception:
-        return default
-
-def tg_enabled() -> bool:
-    return getenv_bool("TG_ENABLED", False) and os.getenv("TELEGRAM_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")
+        return e.response.text
+    except:
+        return str(e)
 
 def tg(msg: str):
-    """Send Telegram message if enabled. Safe no-op otherwise."""
-    if not tg_enabled():
+    if not TG_ENABLED or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
     try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      data={"chat_id": chat_id, "text": msg})
-    except Exception as e:
-        print(f"[TG] send failed: {e}", file=sys.stderr)
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        session.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4096]}, timeout=10)
+    except Exception as exc:
+        print("[TG] failed:", exc)
 
-def log(msg: str):
-    print(msg, flush=True)
-    if "ERROR" in msg or "HTTP" in msg:
-        tg(msg)
-
-# -------------------- Client --------------------
-
-def make_client() -> Client:
-    api_key = os.getenv("API_KEY", "").strip()
-    api_secret = os.getenv("API_SECRET", "").strip()
-    if not api_key or not api_secret:
-        raise RuntimeError("Missing API_KEY / API_SECRET")
-
-    testnet = getenv_bool("USE_TESTNET", False)
-    client = Client(api_key, api_secret, testnet=testnet)
-    # Ensure futures endpoints
-    if testnet:
-        client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-        client.FUTURES_DATA_URL = "https://testnet.binancefuture.com/fapi"
-    return client
-
-# -------------------- Symbols & Filters --------------------
-
-_filters_cache: Dict[str, Dict[str, Any]] = {}
-
-def load_symbols_from_csv(path: str) -> List[str]:
-    syms: List[str] = []
+def load_universe(path: str):
+    out = []
     try:
         with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip().upper()
-                if not s:
-                    continue
-                if not s.endswith("USDT"):
-                    s = s + "USDT"
-                syms.append(s)
-    except Exception as e:
-        raise RuntimeError(f"Failed reading {path}: {e}")
-    return syms
+            for row in f:
+                s = row.strip().upper()
+                if s and not s.startswith("#"):
+                    if not s.endswith("USDT"):
+                        s += "USDT"
+                    out.append(s)
+    except Exception as exc:
+        print("universe load error:", exc)
+    return out[:MAX_SYMBOLS]
 
-def fetch_symbol_filters(client: Client, symbol: str) -> Dict[str, Any]:
-    if symbol in _filters_cache:
-        return _filters_cache[symbol]
-    ex = client.futures_exchange_info()
-    for s in ex["symbols"]:
+UNIVERSE = load_universe(SYMBOLS_CSV)
+
+_symbol_cache = {}
+def fetch_symbol_info(symbol):
+    if symbol in _symbol_cache:
+        return _symbol_cache[symbol]
+    data = get("/fapi/v1/exchangeInfo")
+    for s in data["symbols"]:
         if s["symbol"] == symbol:
-            fs = {f["filterType"]: f for f in s["filters"]}
-            _filters_cache[symbol] = fs
-            return fs
-    raise RuntimeError(f"Symbol {symbol} not found in exchange info.")
+            _symbol_cache[symbol] = s
+            return s
+    raise ValueError("symbol not found: "+symbol)
 
-def _step_from_str(x: str) -> Decimal:
-    d = Decimal(x)
-    return d
-
-def _quantize(value: Decimal, step: Decimal) -> Decimal:
-    # Round DOWN to step
-    q = (value / step).to_integral_value(rounding=ROUND_DOWN) * step
-    # normalize trailing zeros
-    return q.normalize()
-
-def normalize_price(client: Client, symbol: str, price: float) -> str:
-    fs = fetch_symbol_filters(client, symbol)
-    tick = _step_from_str(fs["PRICE_FILTER"]["tickSize"])
-    p = _quantize(Decimal(str(price)), tick)
-    return format(p, "f")
-
-def normalize_qty(client: Client, symbol: str, qty: float) -> str:
-    fs = fetch_symbol_filters(client, symbol)
-    step = _step_from_str(fs["LOT_SIZE"]["stepSize"])
-    q = _quantize(Decimal(str(qty)), step)
-    return format(q, "f")
-
-# -------------------- Position & Leverage --------------------
-
-def ensure_leverage(client: Client, symbol: str, lev: int):
+def step_precision(step):
     try:
-        client.futures_change_leverage(symbol=symbol, leverage=lev)
-    except Exception as e:
-        log(f"⚠️ leverage: {e}")
+        step = float(step)
+        if step == 0:
+            return 8
+        return max(0, int(round(-math.log(step,10))))
+    except:
+        return 8
 
-def get_position_info(client: Client, symbol: str) -> Dict[str, Any]:
-    pos = client.futures_position_information(symbol=symbol)
-    # API returns list with a single dict for the symbol
-    if isinstance(pos, list) and pos:
-        return pos[0]
-    return {}
+def round_step(value, step):
+    p = step_precision(step)
+    return float(f"{value:.{p}f}")
 
-# -------------------- Orders --------------------
+def symbol_filters(symbol):
+    info = fetch_symbol_info(symbol)
+    price_filter = next(f for f in info["filters"] if f["filterType"]=="PRICE_FILTER")
+    lot_filter   = next(f for f in info["filters"] if f["filterType"]=="LOT_SIZE")
+    tick = price_filter["tickSize"]
+    step = lot_filter["stepSize"]
+    return tick, step
 
-def place_market_entry(client: Client, symbol: str, side: str, qty: str) -> Dict[str, Any]:
-    """Open market order with given qty (string)."""
-    params = dict(symbol=symbol, side=side, type=FUTURE_ORDER_TYPE_MARKET, quantity=qty)
-    log(f"▶️ ENTRY {symbol} {side} qty={qty}")
-    return client.futures_create_order(**params)
+def position_risk(symbol):
+    p = {"symbol": symbol, "timestamp": ts()}
+    p = sign(p)
+    return get("/fapi/v2/positionRisk", params=p)
 
-def place_exit_brackets(client: Client, symbol: str, side_open: str,
-                        tp_price_raw: float, sl_price_raw: float):
-    """
-    Create TP/SL exits that close the ENTIRE position using closePosition=true.
-    We must NOT send quantity with closePosition=true.
-    """
-    opp_side = SIDE_SELL if side_open == SIDE_BUY else SIDE_BUY
-    tp_price = normalize_price(client, symbol, tp_price_raw)
-    sl_price = normalize_price(client, symbol, sl_price_raw)
+def set_isolated(symbol):
+    try:
+        p = {"symbol": symbol, "marginType": MARGIN_TYPE.upper(), "timestamp": ts()}
+        p = sign(p)
+        post("/fapi/v1/marginType", params=p)
+    except requests.HTTPError as e:
+        if "-4046" in err_text(e):
+            pass
+        else:
+            print("set_isolated:", err_text(e))
 
-    # TAKE_PROFIT_MARKET
-    tp_params = dict(
-        symbol=symbol,
-        side=opp_side,
-        type="TAKE_PROFIT_MARKET",
-        closePosition=True,
-        reduceOnly=True,
-        stopPrice=tp_price,
-        workingType="CONTRACT_PRICE",
-        priceProtect=True,
-    )
-    # STOP_MARKET
-    sl_params = dict(
-        symbol=symbol,
-        side=opp_side,
-        type="STOP_MARKET",
-        closePosition=True,
-        reduceOnly=True,
-        stopPrice=sl_price,
-        workingType="CONTRACT_PRICE",
-        priceProtect=True,
-    )
-    log(f"🧩 EXITS {symbol} -> TP@{tp_price} / SL@{sl_price}")
-    r1 = client.futures_create_order(**tp_params)
-    r2 = client.futures_create_order(**sl_params)
-    return r1, r2
+def set_leverage(symbol, lev):
+    try:
+        p = {"symbol": symbol, "leverage": int(lev), "timestamp": ts()}
+        p = sign(p)
+        post("/fapi/v1/leverage", params=p)
+    except requests.HTTPError as e:
+        print("leverage:", err_text(e))
 
-# -------------------- Sizing --------------------
+def klines(symbol, interval, limit):
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    return get("/fapi/v1/klines", params=params)
 
-def get_last_price(client: Client, symbol: str) -> float:
-    p = client.futures_symbol_ticker(symbol=symbol)
-    return float(p["price"])
+def ema(values, n):
+    k = 2/(n+1)
+    out, v_ema = [], values[0]
+    for v in values:
+        v_ema = v*k + v_ema*(1-k)
+        out.append(v_ema)
+    return out
 
-def get_wallet_balance(client: Client) -> float:
-    bal = client.futures_account_balance()
-    for b in bal:
-        if b["asset"] == "USDT":
-            return float(b["balance"])
+def rsi(values, n=14):
+    gains=[0]; losses=[0]
+    for i in range(1,len(values)):
+        ch=values[i]-values[i-1]
+        gains.append(max(ch,0)); losses.append(max(-ch,0))
+    def sma(a,n):
+        out=[]; s=sum(a[:n]); out.append(s/n)
+        for i in range(n,len(a)):
+            s+=a[i]-a[i-n]; out.append(s/n)
+        return out
+    if len(values)<n+1: return [50.0]
+    rsg=sma(gains,n); rsl=sma(losses,n)
+    rs=[g/l if l>0 else 100 for g,l in zip(rsg[-len(rsl):], rsl)]
+    return [100-100/(1+max(x,1e-9)) for x in rs]
+
+def get_signal(symbol):
+    try:
+        data = klines(symbol, INTERVAL, 60)
+        closes = [float(k[4]) for k in data]
+        if len(closes) < 30: 
+            return None
+        e9 = ema(closes, 9)
+        e21= ema(closes, 21)
+        r = rsi(closes, 14)[-1]
+        last = closes[-1]
+        buy_score = 0; sell_score=0
+        if e9[-1] > e21[-1]: buy_score += 1
+        if e9[-1] < e21[-1]: sell_score += 1
+        if r < 35: buy_score += 1
+        if r > 65: sell_score += 1
+        if last > e9[-1]: buy_score += 1
+        if last < e9[-1]: sell_score += 1
+        if buy_score/3.0 >= float(CONSENSUS_MIN): return ("BUY", last)
+        if sell_score/3.0 >= float(CONSENSUS_MIN): return ("SELL", last)
+    except Exception as exc:
+        print("signal error", symbol, exc)
+    return None
+
+def new_order(params):
+    params["timestamp"] = ts()
+    p = sign(params)
+    return post("/fapi/v1/order", params=p)
+
+def entry_market(symbol, side, qty):
+    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty}
+    return new_order(params)
+
+def exit_tp_market(symbol, side, stop_price):
+    params = {
+        "symbol": symbol,
+        "side": "SELL" if side=="BUY" else "BUY",
+        "type": "TAKE_PROFIT_MARKET",
+        "stopPrice": stop_price,
+        "workingType": "CONTRACT_PRICE",
+        "closePosition": True
+    }
+    return new_order(params)
+
+def exit_sl_market(symbol, side, stop_price):
+    params = {
+        "symbol": symbol,
+        "side": "SELL" if side=="BUY" else "BUY",
+        "type": "STOP_MARKET",
+        "stopPrice": stop_price,
+        "workingType": "CONTRACT_PRICE",
+        "closePosition": True
+    }
+    return new_order(params)
+
+def get_usdt_balance():
+    try:
+        p = {"timestamp": ts()}
+        p = sign(p)
+        bals = get("/fapi/v2/balance", params=p)
+        for b in bals:
+            if b["asset"] == "USDT":
+                return float(b["balance"])
+    except Exception as exc:
+        print("balance err", exc)
     return 0.0
 
-def compute_entry_qty(client: Client, symbol: str, capital_usdt: float, price: float, leverage: int) -> str:
-    notional = capital_usdt * leverage
-    qty = notional / price
-    return normalize_qty(client, symbol, qty)
+def compute_qty(symbol, entry_price, slot_pct, lev):
+    bal = get_usdt_balance()
+    capital = bal * float(slot_pct) * float(CAPITAL_USE_PCT)
+    if capital <= 0: capital = 10
+    notional = capital * int(lev)
+    qty = notional / entry_price
+    tick, step = symbol_filters(symbol)
+    qty = max(round_step(qty, step), float(step))
+    return qty
 
-# -------------------- Demo flow (single shot) --------------------
+_last_trade_time = {}
+def can_trade(symbol):
+    last = _last_trade_time.get(symbol, 0)
+    return (time.time() - last) >= (int(COOLDOWN_MIN)*60)
+def mark_traded(symbol):
+    _last_trade_time[symbol] = time.time()
 
-def demo_once():
-    """
-    Optional single-shot demo: enter a LONG on first symbol, place TP/SL, then exit.
-    Enable by calling demo_once() in __main__.
-    """
-    client = make_client()
-    csv_path = os.getenv("SYMBOLS_CSV", "universe.csv")
-    symbols = load_symbols_from_csv(csv_path)
-    if not symbols:
-        raise RuntimeError("SYMBOLS_CSV is empty.")
+last_hb = 0
+def heartbeat():
+    global last_hb
+    if time.time()-last_hb >= int(TG_HEARTBEAT_MIN)*60:
+        last_hb = time.time()
+        tg(f"[HB] alive {int(time.time()*1000)} symbols={len(UNIVERSE)}")
 
-    symbol = symbols[0]
+def process_symbol(symbol):
+    sig = get_signal(symbol)
+    if not sig: return
+    side, price = sig
+    if not can_trade(symbol): return
+    set_isolated(symbol)
+    lev = int(SLOT_A_LEV)
+    set_leverage(symbol, lev)
+    tick, step = symbol_filters(symbol)
+    price = round_step(price, tick)
+    qty = compute_qty(symbol, price, SLOT_A_PCT, lev)
+    try:
+        entry_market(symbol, side, qty)
+        tg(f"🟢 ENTRY {symbol} {side} qty={qty}")
+    except requests.HTTPError as e:
+        tg(f"⚠️ ENTRY error {symbol}: {err_text(e)}")
+        return
+    if side=="BUY":
+        tp1 = round_step(price*(1+float(TP1_PCT)), tick)
+        tp2 = round_step(price*(1+float(TP2_PCT)), tick)
+        tp3 = round_step(price*(1+float(TP3_PCT)), tick)
+        sl  = round_step(price*(1-float(SL_PCT)), tick)
+    else:
+        tp1 = round_step(price*(1-float(TP1_PCT)), tick)
+        tp2 = round_step(price*(1-float(TP2_PCT)), tick)
+        tp3 = round_step(price*(1-float(TP3_PCT)), tick)
+        sl  = round_step(price*(1+float(SL_PCT)), tick)
+    try:
+        exit_tp_market(symbol, side, tp1)
+        exit_tp_market(symbol, side, tp2)
+        exit_tp_market(symbol, side, tp3)
+        exit_sl_market(symbol, side, sl)
+        tg(f"🎯 TP/SL set {symbol} tp1={tp1} tp2={tp2} tp3={tp3} sl={sl}")
+    except requests.HTTPError as e:
+        tg(f"⚠️ TP/SL error {symbol}: {err_text(e)}")
+    mark_traded(symbol)
 
-    total_cap_pct = getenv_float("TOTAL_CAPITAL_PCT", 0.40)
-    slot_pct = getenv_float("SLOT_A_PCT", 0.06)
-    lev = int(getenv_float("SLOT_A_LEV", 10))
-    tp_pct = getenv_float("TP1_PCT", 0.0035)
-    sl_pct = getenv_float("SL_PCT", 0.0075)
-
-    # balances & sizing
-    balance = get_wallet_balance(client)
-    capital = balance * total_cap_pct * slot_pct
-    price = get_last_price(client, symbol)
-
-    ensure_leverage(client, symbol, lev)
-    qty = compute_entry_qty(client, symbol, capital, price, lev)
-
-    # open LONG for demo
-    place_market_entry(client, symbol, SIDE_BUY, qty)
-
-    # compute TP/SL prices on entry price
-    tp_price = price * (1.0 + tp_pct)
-    sl_price = price * (1.0 - sl_pct)
-
-    # place exits (closePosition=true)
-    place_exit_brackets(client, symbol, SIDE_BUY, tp_price, sl_price)
-
-    tg(f"✅ Demo entered {symbol} LONG qty={qty} @~{price:.4f}\nTP~{tp_price:.4f} / SL~{sl_price:.4f}")
-
-# -------------------- Main (heartbeat only) --------------------
-
-def main():
-    """
-    Minimal runner: at start, just prints loaded symbols and waits.
-    Your own scanning/strategy logic can call place_market_entry() then place_exit_brackets().
-    """
-    client = make_client()
-    csv_path = os.getenv("SYMBOLS_CSV", "universe.csv")
-    symbols = load_symbols_from_csv(csv_path)
-    tg(f"♻️ Mahdi v5 PRO — تشغيل: {os.getenv('RUN_MODE','live').upper()} | Testnet: {'On' if getenv_bool('USE_TESTNET') else 'Off'}\nSymbols: {symbols}")
-
-    # Heartbeat loop
+def main_loop():
+    tg(f"🚀 Mahdi v5 PRO — تشغيل: {RUN_MODE.upper()} | Testnet: {'On' if 'testnet' in BASE_HOST else 'Off'}")
+    tg(f"Symbols (n={len(UNIVERSE)}): {', '.join(UNIVERSE)}")
     while True:
         try:
-            ts = int(time.time()*1000)
-            log(f"[HB] alive {ts} symbols={len(symbols)}")
-            time.sleep(60)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            log(f"⚠️ loop error: {e}")
-            time.sleep(10)
+            for s in UNIVERSE:
+                process_symbol(s)
+                time.sleep(0.2)
+            heartbeat()
+        except Exception as exc:
+            tg(f"Loop error: {exc}")
+        time.sleep(int(SCAN_INTERVAL))
 
 if __name__ == "__main__":
-    # To run a single demo trade once, uncomment the next line:
-    # demo_once(); sys.exit(0)
-    main()
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        tg("Bot stopped by user.")
