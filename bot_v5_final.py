@@ -618,24 +618,31 @@ def scan_once(symbols):
     for sym in list(symbols):
         try:
             df=get_klines(sym, INTERVAL, KLINES_LIMIT)
-            if len(df)<60: time.sleep(0.1); continue
+            if len(df)<60:
+                time.sleep(0.12)
+                continue
             votes, last, adx_v, atr_v, atr_pct = indicator_votes(df)
             sig, strength = soft_consensus(votes, adx_v, atr_pct)
             if sig in ("BUY","SELL"):
                 hits+=1; signals.append((sym, sig, last, adx_v, strength))
-            time.sleep(0.15)
+            time.sleep(0.18)
         except requests.HTTPError as he:
-            if "-1121" in str(he) or "Invalid symbol" in str(he):
+            msg=str(he)
+            if "-1121" in msg or "Invalid symbol" in msg:
                 to_remove.append(sym)
+                send_tg(f"⚠️ {sym}: Invalid symbol — تمت إزالته من القائمة.")
+            else:
+                errors+=1
+                send_tg(f"⚠️ {sym}: HTTP {msg}")
+        except Exception as e:
             errors+=1
-        except Exception:
-            errors+=1
+            send_tg(f"⚠️ {sym}: Loop error: {e}")
     if to_remove:
         for s in to_remove:
             try: symbols.remove(s)
             except ValueError: pass
-        send_tg("⚠️ تمت إزالة أزواج غير صالحة: " + ", ".join(to_remove))
     return hits, errors, signals
+
 
 def detect_closes_and_notify():
     global _prev_open
