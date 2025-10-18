@@ -1,23 +1,27 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Mahdi v5 PRO - FINAL (LONG & SHORT)
-# Five indicators voting: RSI, MACD, EMA Cross(9/21), ADX(14), Bollinger %B(20)
-# Filters: ADX >= ADX_MIN, cooldown per symbol, consensus >= CONSENSUS_MIN with confirmation on INTERVAL_CONFIRM
-# Real balance sizing from /fapi/v2/balance (availableBalance for USDT)
-# Futures: isolated margin + leverage per symbol
-# Orders:
-# MARKET entry (BUY for long, SELL for short)
-# TP1 & TP2 as TAKE_PROFIT_MARKET with reduceOnly=true and quantity
-# TP3 as TAKE_PROFIT_MARKET closePosition=true (no quantity)
-# SL  as STOP_MARKET        closePosition=true (no quantity)
-   (No timeInForce for *_MARKET orders; workingType=CONTRACT_PRICE)
-# Signed requests with server time sync, to avoid -1022 signature errors.
-# Telegram: heartbeat, signals, errors.
-DISCLAIMER: Trading is risky. Use at your own responsibility.
+"""
+Mahdi v5 PRO - FINAL (LONG & SHORT)
+This bot executes MARKET entries (BUY for long, SELL for short)
+Note: No timeInForce for MARKET orders; workingType=CONTRACT_PRICE
+"""
 
+# =========================================================
+# 📦 Import Required Libraries
+# =========================================================
+import os
+import time
+import hmac
+import hashlib
+import math
+import requests
+import urllib.parse as urlparse
+from datetime import datetime, timezone, timedelta
+import pandas as pd
+import numpy as np
+from dotenv import load_dotenv
+from requests.exceptions import RequestException
 
-import os, time, hmac, hashlib, math, json, logging, traceback
 from typing import List, Dict, Tuple, Any
 import requests
 
