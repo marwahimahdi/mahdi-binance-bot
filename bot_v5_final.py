@@ -2,13 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Mahdi v5 PRO — FINAL (LONG & SHORT) with 3 TPs (40/35/25) using correct precision.
+Mahdi v5 PRO — FINAL (LONG & SHORT) with 3 TPs (40/35/25) + Dynamic SL updates
 
 - Binance USDⓈ-M Futures (REST).
 - Entry: MARKET (BUY for LONG, SELL for SHORT).
 - Exits:
   * 3 × TAKE_PROFIT_MARKET (reduceOnly, with exact quantities via stepSize).
   * 1 × STOP_MARKET (reduceOnly + closePosition=true) يغلق الباقي دائمًا.
+  * Dynamic SL manager:
+      - بعد تحقق TP1: ينقل SL إلى نقطة الدخول Breakeven.
+      - بعد تحقق TP2: ينقل SL إلى مستوى TP1 (قفل ربح).
 - 5 indicators voting: RSI, MACD(hist slope), ADX, EMA200 trend, Stochastic.
 - Filters: EMA200 direction, ADX>=ADX_MIN, cooldown, max open trades, universe.csv.
 - Position sizing: from real USDT available balance:
@@ -105,6 +108,19 @@ def _post(path: str, data: Optional[Dict[str, Any]] = None, signed: bool = True,
         data['signature'] = sign_query(q)
     try:
         r = SESSION.post(BASE_URL + path, data=data, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except RequestException as e:
+        return {'error': str(e), 'text': getattr(e.response, 'text', None)}
+
+def _delete(path: str, params: Optional[Dict[str, Any]] = None, signed: bool = True, timeout: int = 15):
+    params = params or {}
+    if signed:
+        params['timestamp'] = now_ms()
+        q = urlparse.urlencode(params, doseq=True)
+        params['signature'] = sign_query(q)
+    try:
+        r = SESSION.delete(BASE_URL + path, params=params, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except RequestException as e:
@@ -217,7 +233,7 @@ def round_tick(p: float, tick: float) -> float:
     if tick <= 0: return p
     return math.floor(p/tick)*tick
 
-# ---------- Balance & Sizing ----------
+# ---------- Balance, Positions & Sizing ----------
 def fetch_usdt_available() -> float:
     bal = _get('/fapi/v2/balance', signed=True)
     if isinstance(bal, list):
@@ -225,6 +241,23 @@ def fetch_usdt_available() -> float:
             if a.get('asset') == 'USDT':
                 return float(a.get('availableBalance', a.get('balance', '0')))
     return 0.0
+
+def get_position(symbol: str) -> Dict[str, Any]:
+    """Return dict with positionAmt (abs float), entryPrice (float)."""
+    pr = _get('/fapi/v2/positionRisk', {'symbol': symbol}, signed=True)
+    if isinstance(pr, list) and pr:
+        p = pr[0]
+        amt = abs(float(p.get('positionAmt', '0')))
+        ep  = float(p.get('entryPrice', '0'))
+        return {'amt': amt, 'entryPrice': ep}
+    return {'amt': 0.0, 'entryPrice': 0.0}
+
+def open_orders(symbol: str) -> List[Dict[str, Any]]:
+    oo = _get('/fapi/v1/openOrders', {'symbol': symbol}, signed=True)
+    return oo if isinstance(oo, list) else []
+
+def cancel_order(symbol: str, order_id: int):
+    return _delete('/fapi/v1/order', {'symbol': symbol, 'orderId': order_id})
 
 def compute_qty(symbol: str, price: float) -> float:
     info = load_symbol_info(symbol)
@@ -272,6 +305,18 @@ def place_stop(symbol: str, side: str, stop_price: float):
         'stopPrice': f"{stop_price:.10f}",
         'workingType': 'CONTRACT_PRICE'
     })
+
+def replace_stop(symbol: str, side: str, new_stop: float):
+    """Cancel existing closePosition STOP then place a new one at new_stop."""
+    # cancel existing stop orders
+    for o in open_orders(symbol):
+        if o.get('type') in ('STOP', 'STOP_MARKET') and o.get('reduceOnly') and str(o.get('closePosition', '')).lower() == 'true':
+            try:
+                cancel_order(symbol, int(o['orderId']))
+            except Exception:
+                pass
+    # place new
+    return place_stop(symbol, side, new_stop)
 
 # ---------- Strategy (5 indicators + filters) ----------
 def analyze_symbol(symbol: str):
@@ -340,9 +385,21 @@ def analyze_symbol(symbol: str):
 
     return {'symbol': symbol, 'side': side, 'entry': entry, 'tp': [tp1, tp2, tp3], 'sl': sl, 'score': score, 'price': entry}
 
-# ---------- Loop ----------
+# ---------- Loop & State ----------
 last_heartbeat_ts = 0.0
 last_signal_ts_by_symbol: Dict[str, float] = {}
+
+# حالة مراكزنا النشطة داخل الذاكرة
+# state[symbol] = {
+#   'side': 'LONG'|'SHORT',
+#   'entry_price': float,
+#   'entry_qty': float,
+#   'tp_prices': [tp1,tp2,tp3],
+#   'sl_initial': float,
+#   'moved_be': bool,
+#   'moved_tp1lock': bool
+# }
+active_state: Dict[str, Dict[str, Any]] = {}
 
 def can_trade(symbol: str) -> bool:
     last = last_signal_ts_by_symbol.get(symbol, 0.0)
@@ -356,7 +413,48 @@ def heartbeat():
         tg(f"[HB] alive {int(time.time()*1000)} symbols={len(syms)}")
         last_heartbeat_ts = time.time()
 
+def reconcile_positions():
+    """يراقب تقدم الصفقة ويُعدل SL بعد TP1/TP2 تلقائيًا."""
+    to_clear = []
+    for sym, st in active_state.items():
+        pos = get_position(sym)
+        rem = pos['amt']
+        if rem <= 0.0:
+            to_clear.append(sym)
+            continue
+        entry_qty = st['entry_qty']
+        if entry_qty <= 0: 
+            continue
+
+        # thresholds
+        tp1_done_qty = entry_qty * (1.0 - TP_SPLIT[0])
+        tp2_done_qty = entry_qty * (1.0 - (TP_SPLIT[0] + TP_SPLIT[1]))
+        reduce_side = 'SELL' if st['side'] == 'LONG' else 'BUY'
+        tick = load_symbol_info(sym)['tickSize']
+
+        # بعد TP1 -> انقل SL إلى breakeven (سعر الدخول)
+        if not st.get('moved_be', False) and rem <= tp1_done_qty + 1e-12:
+            new_sl = st['entry_price']
+            new_sl = round_tick(new_sl, tick)
+            replace_stop(sym, reduce_side, new_sl)
+            st['moved_be'] = True
+            tg(f"🔒 {sym} SL → Breakeven @ {new_sl:.6f} (بعد TP1)")
+
+        # بعد TP2 -> انقل SL إلى TP1 لقفل ربح
+        if st.get('moved_be', False) and not st.get('moved_tp1lock', False) and rem <= tp2_done_qty + 1e-12:
+            new_sl = st['tp_prices'][0]  # TP1 price
+            new_sl = round_tick(new_sl, tick)
+            replace_stop(sym, reduce_side, new_sl)
+            st['moved_tp1lock'] = True
+            tg(f"🧷 {sym} SL → TP1 @ {new_sl:.6f} (بعد TP2)")
+
+    for s in to_clear:
+        active_state.pop(s, None)
+
 def scan_and_trade():
+    # قبل المسح عدّل SL إن لزم
+    reconcile_positions()
+
     syms = load_universe(SYMBOLS_CSV)
     if TG_ENABLED and TG_NOTIFY_UNIVERSE:
         tg("📊 Universe: " + ", ".join(syms[:12]) + ("..." if len(syms) > 12 else ""))
@@ -398,7 +496,7 @@ def scan_and_trade():
         # كميات TPs (40/35/25) بدقة stepSize
         q1 = round_step(qty_total * TP_SPLIT[0], step)
         q2 = round_step(qty_total * TP_SPLIT[1], step)
-        # الباقي يذهب لـ TP3، ثم نطابقه للـ stepSize مع عدم تجاوزه الإجمالي
+        # الباقي يذهب لـ TP3
         q3 = qty_total - q1 - q2
         q3 = round_step(max(q3, 0.0), step)
         # تصحيح في حال ضاعت كسور
@@ -408,19 +506,29 @@ def scan_and_trade():
         reduce_side = 'SELL' if side == 'LONG' else 'BUY'
 
         # أوامر TP منفصلة بكميات محددة
-        tp_res = []
         if q1 >= info['minQty']:
-            tp_res.append(place_take_profit(s, reduce_side, tp_prices[0], q1))
+            place_take_profit(s, reduce_side, tp_prices[0], q1)
         if q2 >= info['minQty']:
-            tp_res.append(place_take_profit(s, reduce_side, tp_prices[1], q2))
+            place_take_profit(s, reduce_side, tp_prices[1], q2)
         if q3 >= info['minQty']:
-            tp_res.append(place_take_profit(s, reduce_side, tp_prices[2], q3))
+            place_take_profit(s, reduce_side, tp_prices[2], q3)
 
         # SL يُغلق المتبقي كله
-        sl_res = place_stop(s, reduce_side, sl_price)
+        place_stop(s, reduce_side, sl_price)
 
-        tg(f"✅ {s} {side} @~{entry_price:.6f} | TP1~{tp_prices[0]:.6f}({q1}) "
-           f"TP2~{tp_prices[1]:.6f}({q2}) TP3~{tp_prices[2]:.6f}({q3}) SL~{sl_price:.6f} | score={sig['score']:.2f}")
+        # خزّن الحالة للمتابعة الديناميكية للـ SL
+        active_state[s] = {
+            'side': side,
+            'entry_price': entry_price,
+            'entry_qty': qty_total,
+            'tp_prices': tp_prices,
+            'sl_initial': sl_price,
+            'moved_be': False,
+            'moved_tp1lock': False
+        }
+
+        tg(f"✅ {s} {side} @~{entry_price:.6f} | TP1~{tp_prices[0]:.6f} "
+           f"TP2~{tp_prices[1]:.6f} TP3~{tp_prices[2]:.6f} SL~{sl_price:.6f} | qty={qty_total} | score={sig['score']:.2f}")
 
         last_signal_ts_by_symbol[s] = time.time()
         open_trades += 1
