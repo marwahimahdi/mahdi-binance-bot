@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MahdiBot v5 FINAL — LIVE
+MahdiBot v5 FINAL — LIVE (Auto-TopN + Dynamic Trailing SL)
 - Binance USDT-M Futures (PERPETUAL/TRADING) only
-- Auto-Scan Mode (Top N by 24h quote volume)
+- Auto-Scan Mode (Top N by 24h quote volume)  ✅
+- Dynamic Trailing Stop-Loss after arming threshold  ✅
 - Indicators: EMA(21/50), MACD(12,26,9), RSI(14), Supertrend(10,3), VWAP(50)
 - Filters: ADX>=20, ATR/Close>=0.0025, consensus ratio>=0.65 & min-agree>=2
 - Dynamic leverage/size (5x/10x) with 5%/6% allocation (total cap 40%, max open=6)
 - 3 TPs: 0.35% / 0.7% / 1.2% (strong: 0.5% / 1.0% / 1.8%)
-- After TP1 -> Breakeven, After TP2 -> lock profit
+- After TP1 -> Breakeven, After TP2 -> lock profit (tight SL)
 - Kill-switch daily at -5% balance
 - Watchdog no-activity alerts
 - Force ISOLATED margin
@@ -62,12 +63,18 @@ TP2_PCT_STRONG = float(os.getenv("TP2_PCT_STRONG","0.010"))
 TP3_PCT_STRONG = float(os.getenv("TP3_PCT_STRONG","0.018"))
 TP_SHARES_STRONG = os.getenv("TP_SHARES_STRONG","0.35,0.35,0.30")
 
+# Dynamic Trailing SL (new)
+TRAIL_ENABLE = os.getenv("TRAIL_ENABLE","true").lower() in ("1","true","yes")
+TRAIL_PCT = float(os.getenv("TRAIL_PCT","0.004"))              # 0.4%
+TRAIL_ARM_AFTER = float(os.getenv("TRAIL_ARM_AFTER","0.006"))  # يُفعّل بعد +0.6% ربح (أو TP1)
+TRAIL_COOLDOWN_SEC = int(os.getenv("TRAIL_COOLDOWN_SEC","45")) # لا نحدّث SL أكثر من مرّة كل 45 ثانية
+
 # Telegram
 TG_TOKEN  = os.getenv("TELEGRAM_TOKEN","")
 TG_CHATID = os.getenv("TELEGRAM_CHAT_ID","")
 TG_ENABLED = os.getenv("TG_ENABLED","true").lower() in ("1","true","yes")
 TG_NOTIFY_WEAK = os.getenv("TG_NOTIFY_WEAK","false").lower() in ("1","true","yes")
-TG_NOTIFY_UNIVERSE = os.getenv("TG_NOTIFY_UNIVERSE","false").lower() in ("1","true","yes")  # <— افتراضيًا False لمنع الإرسال المبكر
+TG_NOTIFY_UNIVERSE = os.getenv("TG_NOTIFY_UNIVERSE","false").lower() in ("1","true","yes")  # افتراضيًا False
 
 # Risk
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT","0.05"))
@@ -77,9 +84,9 @@ DEFAULT_MARGIN_TYPE  = os.getenv("MARGIN_TYPE","ISOLATED").upper()
 REST_BACKOFF_BASE = float(os.getenv("REST_BACKOFF_BASE", "0.35"))
 REST_BACKOFF_MAX  = float(os.getenv("REST_BACKOFF_MAX",  "8"))
 
-# Universe cache (نعطّله مؤقتًا)
+# Universe cache
 CACHE_PATH = pathlib.Path("/tmp/mahdi_valid_syms.json")
-CACHE_TTL_SEC = 0  # كان 86400
+CACHE_TTL_SEC = 0
 
 # ========= Endpoints =========
 BASE = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
@@ -94,6 +101,7 @@ MARGIN_TYPE_EP = f"{BASE}/fapi/v1/marginType"
 DUAL_SIDE_EP = f"{BASE}/fapi/v1/positionSide/dual"
 ORDER_EP = f"{BASE}/fapi/v1/order"
 ALL_OPEN_ORDERS = f"{BASE}/fapi/v1/allOpenOrders"
+OPEN_ORDERS_EP = f"{BASE}/fapi/v1/openOrders"   # NEW: list open orders to update trailing stop
 SERVER_TIME_EP = f"{BASE}/fapi/v1/time"
 INCOME_EP = f"{BASE}/fapi/v1/income"
 USER_TRADES_EP = f"{BASE}/fapi/v1/userTrades"
@@ -140,7 +148,7 @@ def qty_to_step(qty, lot_step, min_qty):
     if q<mq: q=mq
     return str(q.normalize())
 
-# ========= Telegram (diagnostic) =========
+# ========= Telegram =========
 def send_tg(text):
     if not (TG_ENABLED and TG_TOKEN and TG_CHATID):
         print(f"[TG SKIP] enabled={TG_ENABLED} token={bool(TG_TOKEN)} chat_id={TG_CHATID}")
@@ -191,6 +199,9 @@ def _request(method, url, *, params=None, data=None, signed_req=False, timeout=2
                 else:
                     u=url; P=params
                 resp=session.get(u, params=P, timeout=timeout)
+            elif method=="DELETE":
+                payload = signed(params if params else {})
+                resp=session.delete(url+"?"+payload, timeout=timeout)
             else:
                 payload = signed(data) if signed_req else data
                 resp=session.post(url, data=payload, timeout=timeout)
@@ -364,8 +375,7 @@ def fetch_valid_perpetual_usdt():
     return valid
 
 def build_auto_universe():
-    """Top-N by 24h quote volume (USDT-M PERP only) + pre-validate on futures price endpoint.
-       لا ترسل أي رسائل هنا — الإرسال سيكون بعد التحقق النهائي في main()."""
+    """Top-N by 24h quote volume (USDT-M PERP only) + pre-validate on futures price endpoint."""
     valid = fetch_valid_perpetual_usdt()
     tickers = f_get(TICKER_24H, {"type": "FULL"})
     df = pd.DataFrame(tickers)
@@ -410,8 +420,31 @@ def place_market(symbol, side, qty, positionSide=None):
     return _request("POST", ORDER_EP, signed_req=True, data=p)
 
 def cancel_all_orders(symbol):
-    try: _request("DELETE", ALL_OPEN_ORDERS, signed_req=True, data={"symbol":symbol})
+    try: _request("DELETE", ALL_OPEN_ORDERS, params={"symbol":symbol}, signed_req=True)
     except Exception: pass
+
+def list_open_orders(symbol):
+    try:
+        return _request("GET", OPEN_ORDERS_EP, params={"symbol":symbol}, signed_req=True)
+    except Exception:
+        return []
+
+def cancel_order(symbol, order_id):
+    try:
+        _request("DELETE", ORDER_EP, params={"symbol":symbol, "orderId":order_id}, signed_req=True)
+    except Exception:
+        pass
+
+def cancel_existing_stop(symbol):
+    """Cancel any STOP_MARKET closePosition=true orders to avoid duplicates when trailing."""
+    orders = list_open_orders(symbol)
+    for o in orders:
+        try:
+            if o.get("type")=="STOP_MARKET" and str(o.get("closePosition","false")).lower()=="true":
+                cancel_order(symbol, o.get("orderId"))
+                time.sleep(0.05)
+        except Exception:
+            continue
 
 def fmt_price(x):
     try: return f"{float(x):.8f}".rstrip("0").rstrip(".")
@@ -558,7 +591,7 @@ def detect_tp_fills(symbol):
             mark_activity("TP1 filled", f"{symbol} exec≈{fmt_price(exec_px)}")
             if BREAKEVEN_AFTER_TP1:
                 try:
-                    cancel_all_orders(symbol)
+                    cancel_existing_stop(symbol)
                     is_buy=(st["side"]=="BUY")
                     f=symbol_filters(symbol); tick=f["tick_size"]
                     def price_for(pct):
@@ -583,7 +616,7 @@ def detect_tp_fills(symbol):
     if st.get("tp1_done") and (not st.get("tp2_done")) and total_closed + 1e-12 >= (tp1_target+tp2_target):
         st["tp2_done"]=True
         try:
-            cancel_all_orders(symbol)
+            cancel_existing_stop(symbol)
             is_buy=(st["side"]=="BUY")
             f=symbol_filters(symbol); tick=f["tick_size"]
             def price_for(pct):
@@ -611,6 +644,72 @@ def send_close_summary_real(symbol, entry, qty, side, open_ts_ms, lev):
     emoji="✅ ربح" if pnl>=0 else "❌ خسارة"
     send_tg(f"📘 إغلاق مركز (فعلي)\n<b>{symbol}</b> | {emoji}\nRealized P&L: {pnl:.4f} USDT (PnL {realized:.4f}, Fees {fees:.4f})\nQty {float(qty):.8f} | Lev {lev}x | ROI≈ {roi:.2f}%")
     mark_activity("Closed", f"{symbol} PnL={pnl:.4f}")
+
+# ========= Dynamic Trailing SL =========
+def trailing_manager():
+    if not TRAIL_ENABLE: return
+    for symbol, st in list(state.items()):
+        try:
+            price = get_live_price(symbol)
+            is_long = (st["side"]=="BUY")
+            entry = st["entry"]
+            f = symbol_filters(symbol); tick=f["tick_size"]
+            now = time.time()
+            st.setdefault("trail_max", entry)
+            st.setdefault("trail_min", entry)
+            st.setdefault("trail_armed", False)
+            st.setdefault("last_trail_update_ts", 0.0)
+            st.setdefault("last_sl_price", None)
+
+            # Arm condition: بعد TP1 أو وصول ربح نسبي
+            pnl_pct = (price/entry - 1.0) if is_long else (1.0 - price/entry)
+            if (not st["trail_armed"]) and (st.get("tp1_done") or pnl_pct >= TRAIL_ARM_AFTER):
+                st["trail_armed"] = True
+                send_tg(f"🛰️ تفعيل Trailing SL على <b>{symbol}</b> (pnl≈ {pnl_pct*100:.2f}%)")
+
+            if not st["trail_armed"]:
+                continue
+
+            # تحديث القمة/القاع
+            if is_long:
+                if price > st["trail_max"]:
+                    st["trail_max"] = price
+            else:
+                if price < st["trail_min"]:
+                    st["trail_min"] = price
+
+            # حساب SL المرغوب
+            if is_long:
+                desired = st["trail_max"] * (1.0 - TRAIL_PCT)
+                # لا نسمح بأن يقلّ عن breakeven
+                desired = max(desired, entry)
+            else:
+                desired = st["trail_min"] * (1.0 + TRAIL_PCT)
+                desired = min(desired, entry)
+
+            # تقريب للتِك
+            desired = float(price_to_tick(desired, tick))
+
+            # تبريد التحديثات
+            if st["last_sl_price"] is None or (is_long and desired > st["last_sl_price"]) or (not is_long and desired < st["last_sl_price"]):
+                if now - st["last_trail_update_ts"] >= TRAIL_COOLDOWN_SEC:
+                    # ألغِ SL القديم ثم ضع الجديد
+                    try:
+                        cancel_existing_stop(symbol)
+                    except Exception:
+                        pass
+                    tp_side="SELL" if is_long else "BUY"
+                    data={"symbol":symbol,"side":tp_side,"type":"STOP_MARKET","stopPrice":fmt_price(desired),
+                          "closePosition":"true","workingType":"MARK_PRICE"}
+                    if st.get("positionSide"): data["positionSide"]=st["positionSide"]
+                    _request("POST", ORDER_EP, signed_req=True, data=data)
+                    st["last_trail_update_ts"]=now
+                    st["last_sl_price"]=desired
+                    send_tg(f"📍 تحديث Trailing SL <b>{symbol}</b> → {fmt_price(desired)}")
+                    mark_activity("Trail update", f"{symbol} SL={fmt_price(desired)}")
+        except Exception as e:
+            # لا نُثقل بالتكرار
+            continue
 
 # ========= Scan/Trade loop =========
 def scan_once(symbols):
@@ -774,7 +873,7 @@ def watchdog_check():
 
 # ========= Main =========
 def main():
-    # --- Telegram diagnostics at boot ---
+    # Telegram diagnostics at boot
     print(f"[BOOT] TG_ENABLED={TG_ENABLED} CHAT_ID={TG_CHATID} TOKEN_LEN={len(TG_TOKEN) if TG_TOKEN else 0}")
     try:
         r = session.get(f"https://api.telegram.org/bot{TG_TOKEN}/getMe", timeout=10)
@@ -783,7 +882,7 @@ def main():
         print(f"[BOOT] getMe EXC {e}")
     send_tg("♻️ اختبار اتصال تليجرام — بدء تشغيل Mahdi v5")
 
-    # --- regular startup ---
+    # startup
     send_tg(f"🚀 تشغيل Mahdi v5 — وضع: {RUN_MODE} | Testnet: {'On' if USE_TESTNET else 'Off'}")
     send_tg(f"🔄 Auto-Scan Mode (Top {MAX_SYMBOLS})\n🧩 فحص كل {SCAN_INTERVAL_SEC} ث | حد أقصى {MAX_OPEN_TRADES} صفقات | رافعة 5-10× ديناميكية")
     mark_activity("Startup", f"mode={RUN_MODE}, testnet={USE_TESTNET}")
@@ -792,11 +891,11 @@ def main():
     hedge=is_hedge_mode()
     symbols=load_universe()
 
-    # ---- فحص نهائي لمنع أي رمز غير صالح نهائيًا (يمنع [-1121]) ----
+    # final validation (prevent -1121)
     validated, invalids = [], []
     for s in symbols:
         try:
-            _ = f_get(PRICE_EP, {"symbol": s})  # futures price endpoint
+            _ = f_get(PRICE_EP, {"symbol": s})
             validated.append(s)
             time.sleep(0.01)
         except requests.HTTPError as he:
@@ -808,15 +907,13 @@ def main():
         send_tg("⚠️ تم حذف أزواج غير متاحة على العقود: " + ", ".join(invalids))
     symbols = validated
 
-    # رسالة Universe النهائية فقط بعد التحقق:
     if symbols:
         preview = ", ".join(symbols[:10])
         send_tg(f"📊 Universe النهائي (بعد التحقق): {preview}... (n={len(symbols)})")
     else:
         send_tg("⚠️ بعد التحقق لم يتبقَّ أي زوج صالح، سأعيد المحاولة لاحقًا.")
-    # ----------------------------------------------------------------
 
-    # force isolated as best-effort
+    # force isolated
     for s in symbols:
         try:
             ensure_margin_type(s, DEFAULT_MARGIN_TYPE)
@@ -824,7 +921,7 @@ def main():
         except Exception:
             pass
 
-    # Warm-up: first minute scan 10 symbols only
+    # Warm-up subset
     warmup_until = now_utc() + timedelta(minutes=1)
     initial_subset = symbols[:10]
 
@@ -837,6 +934,7 @@ def main():
                 time.sleep(60); watchdog_check(); continue
 
             if now_utc() < cooldown_until:
+                trailing_manager()          # update trailing SL during cooldown
                 time.sleep(1); watchdog_check(); continue
 
             subset = initial_subset if now_utc() < warmup_until else symbols
@@ -849,6 +947,7 @@ def main():
                 maybe_trade(sym,sig,px,adx_v,strength,hedge)
 
             detect_closes_and_notify()
+            trailing_manager()              # also after actions
 
             if (now_utc()-last_hb)>=timedelta(minutes=HEARTBEAT_MIN):
                 heartbeat(h,e,len(_prev_open), capital_usage_pct()); last_hb=now_utc()
