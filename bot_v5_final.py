@@ -99,15 +99,73 @@ def qty_to_step(qty, lot_step, min_qty):
     if q<mq: q=mq
     return str(q.normalize())
 
-def send_tg(text):
+# مضاد سبام لتليجرام + تهدئة + دمج التكرارات
+_tg_last_ts = 0.0
+_tg_last_msg = ""
+_tg_dup_count = 0
+
+def send_tg(text: str):
+    global _tg_last_ts, _tg_last_msg, _tg_dup_count
+
     if not (TG_ENABLED and TG_TOKEN and TG_CHATID):
-        print("[TG SKIP]", text[:120]); return
+        print("[TG SKIP]", text[:120])
+        return
+
     try:
-        r=session.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                       data={"chat_id":TG_CHATID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},
-                       timeout=10)
-        if r.status_code>=400: print("[TG ERR]", r.status_code, r.text[:200])
-    except Exception as e: print("[TG EXC]", e)
+        # دمج الرسائل المتكررة (لنفس النص) حتى لا نغرق بالسبام
+        if text == _tg_last_msg:
+            _tg_dup_count += 1
+            # تجميع أول 3 تكرارات وعدم إرسالها
+            if _tg_dup_count <= 3:
+                return
+            # في التكرار الرابع نرسل مع عداد xN ثم نصفر العداد
+            text = f"{text} (x{_tg_dup_count})"
+            _tg_dup_count = 0
+        else:
+            _tg_last_msg = text
+            _tg_dup_count = 0
+
+        # تهدئة بسيطة: 1 رسالة كل ~1.5 ثانية
+        now = time.time()
+        wait = 1.5 - (now - _tg_last_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _tg_last_ts = time.time()
+
+        r = session.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={
+                "chat_id": TG_CHATID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+
+        # التعامل مع 429 من تيليجرام
+        if r.status_code == 429:
+            try:
+                j = r.json()
+                ra = int(j.get("parameters", {}).get("retry_after", 5))
+            except Exception:
+                ra = 5
+
+            # لا نوقف البوت لساعات طويلة؛ نطبع ونكتفي بهدوء قصير
+            cap = 60  # ثوانٍ
+            if ra > cap:
+                print(f"[TG 429] retry_after={ra}s (سأتجاهل النوم الطويل وأكتفي بتهدئة قصيرة)")
+                time.sleep(5)
+            else:
+                print(f"[TG 429] النوم {ra}s")
+                time.sleep(ra + 1)
+            return
+
+        if r.status_code >= 400:
+            print("[TG ERR]", r.status_code, r.text[:200])
+
+    except Exception as e:
+        print("[TG EXC]", e)
 
 # ---- server time sync (مهم) ----
 _time_offset_ms = 0
