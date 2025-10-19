@@ -694,7 +694,7 @@ for s in symbols:
 
 symbols = checked
 
-    if symbols:
+if symbols:
         preview=", ".join(symbols[:10])
         if TG_NOTIFY_UNIVERSE: send_tg(f"📊 Universe النهائي (بعد التحقق): {preview}... (n={len(symbols)})")
     else:
