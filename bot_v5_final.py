@@ -9,6 +9,22 @@ import pandas as pd, numpy as np
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
 
+# =======================================================
+# 🔧 تنظيف الرموز من أي محارف غريبة (ضمان رموز صالحة)
+# =======================================================
+
+import re  # مكتبة التعبيرات النمطية لتنظيف النصوص
+
+def _clean_symbol(s: str) -> str:
+    """
+    تنظف الرمز من أي محارف غير الأحرف الكبيرة A-Z أو الأرقام.
+    مثال:
+        " BTCUSDT " → "BTCUSDT"
+        " ETHUSDT\u200f" → "ETHUSDT"
+    """
+    # نحول إلى نص ونحذف أي شيء غير A-Z أو 0-9
+    return re.sub(r'[^A-Z0-9]', '', str(s).upper())
+
 # ========= ENV =========
 API_KEY=os.getenv("API_KEY",""); API_SECRET=os.getenv("API_SECRET","")
 USE_TESTNET=os.getenv("USE_TESTNET","false").lower() in ("1","true","yes")
