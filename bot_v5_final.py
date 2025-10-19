@@ -477,9 +477,9 @@ def trailing_manager():
                 if price>st["trail_max"]: st["trail_max"]=price
                 desired=max(st["trail_max"]*(1.0-TRAIL_PCT), entry)
             else:
-                if price<st["trail_min"]): st["trail_min"]=price
-                desired=min(st["trail_min"]*(1.0+TRAIL_PCT), entry)
-            desired=float(price_to_tick(desired, tick))
+                if price < st["trail_min"]:
+                st["trail_min"] = price
+            desired = min(st["trail_min"] * (1.0 + TRAIL_PCT), entry)
             if st["last_sl_price"] is None or (is_long and desired>st["last_sl_price"]) or ((not is_long) and desired<st["last_sl_price"]):
                 if now-st["last_trail_update_ts"]>=TRAIL_COOLDOWN_SEC:
                     try: cancel_existing_stop(symbol)
