@@ -700,7 +700,7 @@ symbols = checked
     else:
         send_tg("⚠️ بعد التحقق لم يتبقَّ أي زوج صالح، سأعيد المحاولة لاحقًا.")
 
-    for s in symbols:
+for s in symbols:
         try: ensure_margin_type(s, DEFAULT_MARGIN_TYPE); time.sleep(max(REQ_SLEEP,0.03))
         except Exception: pass
 
