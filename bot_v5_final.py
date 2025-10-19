@@ -635,22 +635,26 @@ def scan_once(symbols):
     hits = 0
     errors = 0
     signals = []
+
+    # نجلب قائمة رموز USDT-M PERPETUAL المتاحة الآن مرة واحدة
     valid = fetch_valid_perp_usdt()
 
-    for s in list(symbols):
-        sym = str(s).strip().upper()
+    for sym in list(symbols):
+        # تنظيف وتوحيد شكل الرمز
+        sym = str(sym).strip().upper()
 
-        # تحقق سريع قبل أي طلب
+        # فلترة سريعة قبل أي طلب شبكة
         if sym not in valid:
-            send_tg(f"⚠️ {repr(sym)}: ليس ضمن رموز USDT-M PERPETUAL المتاحة الآن — استبعِد.")
+            send_tg(f"⚠️ {repr(sym)}: ليس ضمن USDT-M PERPETUAL المتاحة الآن — استبعدته.")
             continue
 
         try:
-            # اطبع الرمز بشكل صريح (repr) لكشف أي محارف مختفية لو وجِدت
+            # لوج تشخيصي
             print("[SCAN] symbol =", repr(sym))
 
-            df = get_klines(sym, INTERVAL, KLINES_LIMIT)  # /fapi/v1/klines
-            if len(df) < 60:
+            # قد ترجع None لو كان Invalid symbol (من get_klines المعدّلة)
+            df = get_klines(sym, INTERVAL, KLINES_LIMIT)
+            if df is None or len(df) < 60:
                 time.sleep(max(REQ_SLEEP, 0.12))
                 continue
 
@@ -664,19 +668,19 @@ def scan_once(symbols):
             time.sleep(max(REQ_SLEEP, 0.18))
 
         except requests.HTTPError as he:
-            msg = str(he)
-            if "-1121" in msg or "Invalid symbol" in msg:
-                send_tg(f"⚠️ {repr(sym)}: Invalid symbol — تمت إزالته.")
-                # لا تضف إلى errors هنا لأننا عالجنا السبب
+            # احتياط: لو ظهر -1121 هنا برضه نتجاوز الرمز ونكمل
+            if "-1121" in str(he) or "Invalid symbol" in str(he):
+                send_tg(f"⚠️ {sym}: Invalid symbol — تمت إزالته.")
             else:
                 errors += 1
-                send_tg(f"⚠️ {repr(sym)}: HTTP {msg}")
+                send_tg(f"⚠️ {sym}: HTTP {he}")
 
         except Exception as e:
             errors += 1
-            send_tg(f"⚠️ {repr(sym)}: Loop error: {e}")
+            send_tg(f"⚠️ {sym}: Loop error: {e}")
 
     return hits, errors, signals
+
 
 
 def detect_closes_and_notify():
