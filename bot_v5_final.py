@@ -463,34 +463,61 @@ def detect_tp_fills(symbol):
         except Exception as e: send_tg(f"⚠️ لم أستطع تشديد SL بعد TP2: {e}")
 
 def trailing_manager():
-    if not TRAIL_ENABLE: return
+    if not TRAIL_ENABLE:
+        return
     for symbol, st in list(state.items()):
         try:
-            price=get_live_price(symbol); is_long=(st["side"]=="BUY"); entry=st["entry"]; f=symbol_filters(symbol); tick=f["tick_size"]
-            now=time.time(); st.setdefault("trail_max", entry); st.setdefault("trail_min", entry); st.setdefault("trail_armed", False)
-            st.setdefault("last_trail_update_ts", 0.0); st.setdefault("last_sl_price", None)
-            pnl_pct=(price/entry-1.0) if is_long else (1.0-price/entry)
-            if (not st["trail_armed"]) and (st.get("tp1_done") or pnl_pct>=TRAIL_ARM_AFTER):
-                st["trail_armed"]=True; send_tg(f"🛰️ تفعيل Trailing SL على <b>{symbol}</b> (pnl≈ {pnl_pct*100:.2f}%)")
-            if not st["trail_armed"]: continue
+            price = get_live_price(symbol)
+            is_long = (st["side"] == "BUY")
+            entry = st["entry"]
+            f = symbol_filters(symbol)
+            tick = f["tick_size"]
+            now = time.time()
+            st.setdefault("trail_max", entry)
+            st.setdefault("trail_min", entry)
+            st.setdefault("trail_armed", False)
+            st.setdefault("last_trail_update_ts", 0.0)
+            st.setdefault("last_sl_price", None)
+            pnl_pct = (price / entry - 1.0) if is_long else (1.0 - price / entry)
+            if (not st["trail_armed"]) and (st.get("tp1_done") or pnl_pct >= TRAIL_ARM_AFTER):
+                st["trail_armed"] = True
+                send_tg(f"🛰️ تفعيل Trailing SL على <b>{symbol}</b> (pnl≈ {pnl_pct*100:.2f}%)")
+            if not st["trail_armed"]:
+                continue
             if is_long:
-                if price>st["trail_max"]: st["trail_max"]=price
-                desired=max(st["trail_max"]*(1.0-TRAIL_PCT), entry)
+                if price > st["trail_max"]:
+                    st["trail_max"] = price
+                desired = max(st["trail_max"] * (1.0 - TRAIL_PCT), entry)
             else:
                 if price < st["trail_min"]:
-                st["trail_min"] = price
-            desired = min(st["trail_min"] * (1.0 + TRAIL_PCT), entry)
-            if st["last_sl_price"] is None or (is_long and desired>st["last_sl_price"]) or ((not is_long) and desired<st["last_sl_price"]):
-                if now-st["last_trail_update_ts"]>=TRAIL_COOLDOWN_SEC:
-                    try: cancel_existing_stop(symbol)
-                    except Exception: pass
-                    tp_side="SELL" if is_long else "BUY"
-                    data={"symbol":symbol,"side":tp_side,"type":"STOP_MARKET","stopPrice":fmt_price(desired),"closePosition":"true","workingType":"MARK_PRICE"}
-                    if st.get("positionSide"): data["positionSide"]=st["positionSide"]
+                    st["trail_min"] = price
+                desired = min(st["trail_min"] * (1.0 + TRAIL_PCT), entry)
+            desired = float(price_to_tick(desired, tick))
+            if st["last_sl_price"] is None or (is_long and desired > st["last_sl_price"]) or ((not is_long) and desired < st["last_sl_price"]):
+                if now - st["last_trail_update_ts"] >= TRAIL_COOLDOWN_SEC:
+                    try:
+                        cancel_existing_stop(symbol)
+                    except Exception:
+                        pass
+                    tp_side = "SELL" if is_long else "BUY"
+                    data = {
+                        "symbol": symbol,
+                        "side": tp_side,
+                        "type": "STOP_MARKET",
+                        "stopPrice": fmt_price(desired),
+                        "closePosition": "true",
+                        "workingType": "MARK_PRICE"
+                    }
+                    if st.get("positionSide"):
+                        data["positionSide"] = st["positionSide"]
                     _request("POST", ORDER_EP, signed_req=True, data=data)
-                    st["last_trail_update_ts"]=now; st["last_sl_price"]=desired
-                    send_tg(f"📍 تحديث Trailing SL <b>{symbol}</b> → {fmt_price(desired)}"); mark_activity("Trail update", f"{symbol} SL={fmt_price(desired)}")
-        except Exception: continue
+                    st["last_trail_update_ts"] = now
+                    st["last_sl_price"] = desired
+                    send_tg(f"📍 تحديث Trailing SL <b>{symbol}</b> → {fmt_price(desired)}")
+                    mark_activity("Trail update", f"{symbol} SL={fmt_price(desired)}")
+        except Exception:
+            continue
+
 
 def scan_once(symbols):
     hits=0; errors=0; signals=[]
