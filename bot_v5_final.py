@@ -254,33 +254,27 @@ def build_auto_universe():
 
 def load_universe(top_n=15):
     try:
-        # جلب معلومات السوق من واجهة الفيوتشر فقط
-        url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-        r = requests.get(url, timeout=15)
-        info = r.json()
+        # ✅ 1. نحصل فقط على رموز FUTURES الدائمة USDT
+        info = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15).json()
+        valid = [
+            s["symbol"] for s in info["symbols"]
+            if s.get("status") == "TRADING"
+            and s.get("quoteAsset") == "USDT"
+            and s.get("contractType") == "PERPETUAL"
+        ]
 
-        valid = []
-        for s in info["symbols"]:
-            if (
-                s.get("status") == "TRADING"
-                and s.get("quoteAsset") == "USDT"
-                and s.get("contractType") == "PERPETUAL"
-            ):
-                valid.append(s["symbol"])
+        # ✅ 2. نحصل على حجم التداول لـ futures فقط
+        tickers = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15).json()
+        tickers = [t for t in tickers if t["symbol"] in valid]
+        tickers = sorted(tickers, key=lambda x: float(x["quoteVolume"]), reverse=True)
 
-        # الآن نأخذ Top N حسب حجم التداول من واجهة FUTURES
-        url2 = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-        t = requests.get(url2, timeout=15).json()
-        t = [x for x in t if x["symbol"] in valid]
-        t = sorted(t, key=lambda x: float(x["quoteVolume"]), reverse=True)
-        top = [x["symbol"] for x in t[:top_n]]
-
+        top = [t["symbol"] for t in tickers[:top_n]]
         send_tg(f"📊 Universe النهائي (بعد التحقق): {', '.join(top)} (n={len(top)})")
         return top
 
     except Exception as e:
         send_tg(f"⚠️ load_universe error: {e}")
-        return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+        return ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
 
 
 def place_market(symbol, side, qty, positionSide=None):
