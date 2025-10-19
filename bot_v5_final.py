@@ -520,21 +520,52 @@ def trailing_manager():
 
 
 def scan_once(symbols):
-    hits=0; errors=0; signals=[]
-    for sym in list(symbols):
+    hits = 0
+    errors = 0
+    signals = []
+    valid = fetch_valid_perp_usdt()
+
+    for s in list(symbols):
+        sym = str(s).strip().upper()
+
+        # تحقق سريع قبل أي طلب
+        if sym not in valid:
+            send_tg(f"⚠️ {repr(sym)}: ليس ضمن رموز USDT-M PERPETUAL المتاحة الآن — استبعِد.")
+            continue
+
         try:
-            df=get_klines(sym, INTERVAL, KLINES_LIMIT)
-            if len(df)<60: time.sleep(max(REQ_SLEEP,0.12)); continue
-            votes,last,adx_v,atr_v,atr_pct=indicator_votes(df)
+            # اطبع الرمز بشكل صريح (repr) لكشف أي محارف مختفية لو وجِدت
+            print("[SCAN] symbol =", repr(sym))
+
+            df = get_klines(sym, INTERVAL, KLINES_LIMIT)  # /fapi/v1/klines
+            if len(df) < 60:
+                time.sleep(max(REQ_SLEEP, 0.12))
+                continue
+
+            votes, last, adx_v, atr_v, atr_pct = indicator_votes(df)
             direction, ratio, agree = fixed_consensus(votes, adx_v, atr_pct)
-            if direction in ("BUY","SELL"): hits+=1; signals.append((sym, direction, last, adx_v, ratio))
-            time.sleep(max(REQ_SLEEP,0.18))
+
+            if direction in ("BUY", "SELL"):
+                hits += 1
+                signals.append((sym, direction, last, adx_v, ratio))
+
+            time.sleep(max(REQ_SLEEP, 0.18))
+
         except requests.HTTPError as he:
-            if "-1121" in str(he) or "Invalid symbol" in str(he): send_tg(f"⚠️ {sym}: Invalid symbol — تمت إزالته.")
-            else: errors+=1; send_tg(f"⚠️ {sym}: HTTP {he}")
+            msg = str(he)
+            if "-1121" in msg or "Invalid symbol" in msg:
+                send_tg(f"⚠️ {repr(sym)}: Invalid symbol — تمت إزالته.")
+                # لا تضف إلى errors هنا لأننا عالجنا السبب
+            else:
+                errors += 1
+                send_tg(f"⚠️ {repr(sym)}: HTTP {msg}")
+
         except Exception as e:
-            errors+=1; send_tg(f"⚠️ {sym}: Loop error: {e}")
+            errors += 1
+            send_tg(f"⚠️ {repr(sym)}: Loop error: {e}")
+
     return hits, errors, signals
+
 
 def detect_closes_and_notify():
     global _prev_open
