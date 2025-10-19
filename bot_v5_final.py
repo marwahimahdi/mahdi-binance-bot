@@ -588,7 +588,7 @@ def main():
     send_tg(f"🚀 تشغيل Mahdi v5 — وضع: {RUN_MODE} | Testnet: {'On' if USE_TESTNET else 'Off'}")
     send_tg(f"🔄 Auto-Scan Mode (Top {MAX_SYMBOLS}) | فحص كل {SCAN_INTERVAL_SEC}s | أقصى صفقات {MAX_OPEN_TRADES}")
     mark_activity("Startup", f"mode={RUN_MODE}, testnet={USE_TESTNET}")
-    sync_server_time(); hedge=is_hedge_mode(); symbols=load_universe()
+    sync_server_time(); hedge=is_hedge_mode(); symbols=load_universe(MAX_SYMBOLS)
     if symbols:
         preview=", ".join(symbols[:10]); 
         if TG_NOTIFY_UNIVERSE: send_tg(f"📊 Universe النهائي (بعد التحقق): {preview}... (n={len(symbols)})")
