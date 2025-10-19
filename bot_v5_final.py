@@ -432,6 +432,10 @@ def load_universe(top_n=None):
             continue
 
     send_tg(f"📊 Universe (Auto-Top{top_n}): {', '.join(out[:10])}... (n={len(out)})")
+    # ========== DEBUG VALID PAIRS ==========
+valid = fetch_valid_perp_usdt()
+send_tg(f"[DEBUG] valid_count={len(valid)} | BTCUSDT in valid? { 'BTCUSDT' in valid } | ETHUSDT in valid? { 'ETHUSDT' in valid }")
+# ======================================
     return out
 
 def place_market(symbol, side, qty, positionSide=None):
