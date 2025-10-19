@@ -92,7 +92,7 @@ def send_tg(text):
     except Exception as e: print("[TG EXC]", e)
 
 _time_offset_ms=0
-def print("[DEBUG] SYMBOLS_CSV =", repr(SYMBOLS_CSV))
+print("[DEBUG] SYMBOLS_CSV =", repr(SYMBOLS_CSV))
 send_tg(f"[DEBUG] SYMBOLS_CSV={SYMBOLS_CSV}")
 sync_server_time():
     global _time_offset_ms
