@@ -641,7 +641,28 @@ def main():
     print("[DEBUG] SYMBOLS_CSV =", repr(SYMBOLS_CSV))
     send_tg(f"[DEBUG] SYMBOLS_CSV={SYMBOLS_CSV}")
 
-    sync_server_time(); hedge=is_hedge_mode(); symbols=load_universe(MAX_SYMBOLS)
+    sync_server_time()
+hedge = is_hedge_mode()
+
+# حمّل ونسّق الرموز
+symbols = load_universe(MAX_SYMBOLS)
+symbols = [str(s).strip().upper() for s in symbols]
+
+# تأكد أنها فعلاً رموز USDT-M PERPETUAL المتاحة الآن
+valid = fetch_valid_perp_usdt()
+symbols = [s for s in symbols if s in valid]
+
+# فلترة مزدوجة بالتسعير الفعلي (لو بقي شيء غريب)
+checked = []
+for s in symbols:
+    try:
+        _ = f_get(PRICE_EP, {"symbol": s})
+        checked.append(s)
+    except Exception as e:
+        send_tg(f"⚠️ {repr(s)}: استبعدته أثناء الفحص الأولي ({e})")
+
+symbols = checked
+
     if symbols:
         preview=", ".join(symbols[:10])
         if TG_NOTIFY_UNIVERSE: send_tg(f"📊 Universe النهائي (بعد التحقق): {preview}... (n={len(symbols)})")
