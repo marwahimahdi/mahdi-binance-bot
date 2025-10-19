@@ -286,10 +286,21 @@ def ensure_margin_type(symbol, mt):
         if "4048" in str(e): send_tg(f"⚠️ لا يمكن تغيير هامش <b>{symbol}</b> إلى {mt} لوجود صفقات/أوامر مفتوحة.")
 
 def get_klines(symbol, interval="5m", limit=200):
-    data=f_get(KLINES, {"symbol":symbol,"interval":interval,"limit":limit})
-    cols=["open_time","open","high","low","close","volume","close_time","q","t","tb","tq","i"]; df=pd.DataFrame(data, columns=cols)
-    for c in ["open","high","low","close","volume"]: df[c]=df[c].astype(float)
+    try:
+        data = f_get(KLINES, {"symbol": symbol, "interval": interval, "limit": limit})
+    except requests.HTTPError as he:
+        # تجاوز الرمز إن كان Invalid symbol
+        if "-1121" in str(he) or "Invalid symbol" in str(he):
+            send_tg(f"⚠️ {symbol}: Invalid symbol — تمّ تجاوزه.")
+            return None
+        # أي خطأ آخر: أعِد رفعه
+        raise
+    cols = ["open_time","open","high","low","close","volume","close_time","q","t","tb","tq","i"]
+    df = pd.DataFrame(data, columns=cols)
+    for c in ["open","high","low","close","volume"]:
+        df[c] = df[c].astype(float)
     return df
+
 
 def get_live_price(symbol): j=f_get(PRICE_EP, {"symbol":symbol}); return float(j["price"])
 
