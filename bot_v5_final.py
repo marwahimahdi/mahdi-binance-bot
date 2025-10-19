@@ -695,14 +695,19 @@ for s in symbols:
 symbols = checked
 
 if symbols:
-        preview=", ".join(symbols[:10])
-        if TG_NOTIFY_UNIVERSE: send_tg(f"📊 Universe النهائي (بعد التحقق): {preview}... (n={len(symbols)})")
-    else:
-        send_tg("⚠️ بعد التحقق لم يتبقَّ أي زوج صالح، سأعيد المحاولة لاحقًا.")
+    preview = ", ".join(symbols[:10])
+    if TG_NOTIFY_UNIVERSE:
+        send_tg(f"📊 Universe (بعد التحقق) النهائي: {preview}... (n={len(symbols)})")
+else:
+    send_tg("⚠️ بعد التحقق لم يتبقَّ أي زوج صالح، سأعيد المحاولة لاحقًا.")
 
 for s in symbols:
-        try: ensure_margin_type(s, DEFAULT_MARGIN_TYPE); time.sleep(max(REQ_SLEEP,0.03))
-        except Exception: pass
+    try:
+        ensure_margin_type(s, DEFAULT_MARGIN_TYPE)
+        time.sleep(max(REQ_SLEEP, 0.03))
+    except Exception:
+        pass
+
 
     warmup_until=now_utc()+timedelta(minutes=1); initial_subset=symbols[:10]
     last_hb=now_utc()-timedelta(minutes=HEARTBEAT_MIN+1); cooldown_until=now_utc()
