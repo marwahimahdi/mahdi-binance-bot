@@ -94,9 +94,9 @@ def send_tg(text):
 _time_offset_ms=0
 
 def main():
-print("[DEBUG] SYMBOLS_CSV =", repr(SYMBOLS_CSV))
-send_tg(f"[DEBUG] SYMBOLS_CSV={SYMBOLS_CSV}")
-sync_server_time()
+    print("[DEBUG] SYMBOLS_CSV =", repr(SYMBOLS_CSV))
+    send_tg(f"[DEBUG] SYMBOLS_CSV={SYMBOLS_CSV}")
+    sync_server_time()
     global _time_offset_ms
     try:
         r=session.get(SERVER_TIME_EP, timeout=10); r.raise_for_status()
