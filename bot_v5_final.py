@@ -710,6 +710,15 @@ for s in symbols:
 
 symbols = checked
 
+# ✅ التحقق النهائي من صلاحية الرموز في Binance
+for sym in symbols:
+    try:
+        ensure_margin_type(sym, DEFAULT_MARGIN_TYPE)
+        time.sleep(max(REQ_SLEEP, 0.03))  # مهلة قصيرة بين الطلبات
+    except Exception as e:
+        send_tg(f"⚠️ {repr(sym)}: Loop error: {e}")
+        time.sleep(0.5)  # لتجنّب ضغط رسائل التلغرام
+
 if symbols:
     preview = ", ".join(symbols[:10])
     if TG_NOTIFY_UNIVERSE:
