@@ -252,20 +252,36 @@ def build_auto_universe():
         except Exception: continue
     return final
 
-def load_universe():
-    if SYMBOLS_CSV:
-        try:
-            df=pd.read_csv(SYMBOLS_CSV); syms=[str(x).strip().upper().split()[0].split(",")[0] for x in df[df.columns[0]].tolist()]
-        except Exception: syms=[]
-        valid=fetch_valid_perp_usdt(); syms=[s for s in syms if s in valid]
-    else:
-        syms=build_auto_universe()
-    validated, invalids = [], []
-    for s in syms:
-        try: _=f_get(PRICE_EP, {"symbol":s}); validated.append(s)
-        except Exception: invalids.append(s)
-    if invalids and TG_NOTIFY_UNIVERSE: send_tg("⚠️ تم حذف أزواج غير صالحة: "+", ".join(invalids))
-    return validated
+def load_universe(top_n=15):
+    try:
+        # جلب معلومات السوق من واجهة الفيوتشر فقط
+        url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+        r = requests.get(url, timeout=15)
+        info = r.json()
+
+        valid = []
+        for s in info["symbols"]:
+            if (
+                s.get("status") == "TRADING"
+                and s.get("quoteAsset") == "USDT"
+                and s.get("contractType") == "PERPETUAL"
+            ):
+                valid.append(s["symbol"])
+
+        # الآن نأخذ Top N حسب حجم التداول من واجهة FUTURES
+        url2 = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+        t = requests.get(url2, timeout=15).json()
+        t = [x for x in t if x["symbol"] in valid]
+        t = sorted(t, key=lambda x: float(x["quoteVolume"]), reverse=True)
+        top = [x["symbol"] for x in t[:top_n]]
+
+        send_tg(f"📊 Universe النهائي (بعد التحقق): {', '.join(top)} (n={len(top)})")
+        return top
+
+    except Exception as e:
+        send_tg(f"⚠️ load_universe error: {e}")
+        return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+
 
 def place_market(symbol, side, qty, positionSide=None):
     f=symbol_filters(symbol); qty_str=qty_to_step(qty, f["lot_step"], f["min_qty"])
