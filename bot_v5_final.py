@@ -14,7 +14,7 @@ API_KEY=os.getenv("API_KEY",""); API_SECRET=os.getenv("API_SECRET","")
 USE_TESTNET=os.getenv("USE_TESTNET","false").lower() in ("1","true","yes")
 RUN_MODE=os.getenv("RUN_MODE","live")
 INTERVAL=os.getenv("INTERVAL","5m")
-MAX_SYMBOLS=int(os.getenv("MAX_SYMBOLS","15"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", os.getenv("TOP_N", "10")))
 SCAN_INTERVAL_SEC=int(os.getenv("SCAN_INTERVAL_SEC","120"))
 COOLDOWN_MIN=int(os.getenv("COOLDOWN_MIN","15"))
 KLINES_LIMIT=int(os.getenv("KLINES_LIMIT","200"))
@@ -252,29 +252,63 @@ def build_auto_universe():
         except Exception: continue
     return final
 
-def load_universe(top_n=15):
-    try:
-        # ✅ 1. نحصل فقط على رموز FUTURES الدائمة USDT
-        info = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15).json()
-        valid = [
-            s["symbol"] for s in info["symbols"]
-            if s.get("status") == "TRADING"
-            and s.get("quoteAsset") == "USDT"
-            and s.get("contractType") == "PERPETUAL"
-        ]
+def load_universe(top_n=None):
+    # احترم MAX_SYMBOLS إن لم يُمرر top_n
+    top_n = int(top_n or os.getenv("MAX_SYMBOLS", "10"))
 
-        # ✅ 2. نحصل على حجم التداول لـ futures فقط
-        tickers = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15).json()
-        tickers = [t for t in tickers if t["symbol"] in valid]
-        tickers = sorted(tickers, key=lambda x: float(x["quoteVolume"]), reverse=True)
+    # 1) اجلب قائمة الرموز المسموحة: USDT-PERPETUAL فقط (FUTURES)
+    valid = fetch_valid_perp_usdt()  # يستخدم /fapi/v1/exchangeInfo
 
-        top = [t["symbol"] for t in tickers[:top_n]]
-        send_tg(f"📊 Universe النهائي (بعد التحقق): {', '.join(top)} (n={len(top)})")
-        return top
+    # 2) حاول قراءة CSV إذا SYMBOLS_CSV موجود
+    if SYMBOLS_CSV:
+        try:
+            try:
+                df = pd.read_csv(SYMBOLS_CSV)              # مع عنوان عمود "symbol"
+            except Exception:
+                df = pd.read_csv(SYMBOLS_CSV, header=None, names=["symbol"])  # بدون عنوان
+            syms = [str(s).strip().upper() for s in df["symbol"] if str(s).strip()]
+            # فلترة لرموز FUTURES المسموحة
+            syms = [s for s in syms if s in valid]
 
-    except Exception as e:
-        send_tg(f"⚠️ load_universe error: {e}")
-        return ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
+            out = []
+            for s in syms:
+                try:
+                    _ = f_get(PRICE_EP, {"symbol": s})     # تأكيد أنه قابل للتسعير
+                    out.append(s)
+                    if len(out) >= top_n:
+                        break
+                except Exception:
+                    continue
+
+            if out:
+                send_tg(f"📊 Universe من CSV: {', '.join(out)} (n={len(out)})")
+                return out
+        except Exception as e:
+            send_tg(f"⚠️ تعذر قراءة CSV: {e}")
+
+    # 3) السقوط إلى Auto-TopN (FUTURES فقط) إذا لم ينجح CSV
+    tickers = f_get(TICKER_24H, {"type": "FULL"})
+    df = pd.DataFrame(tickers)
+    df = df[df["symbol"].isin(valid)].copy()
+    if df.empty:
+        send_tg("⚠️ لا مرشحين بعد الفلترة — سأعيد المحاولة.")
+        return []
+    df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce").fillna(0.0)
+
+    candidates = df.sort_values("quoteVolume", ascending=False)["symbol"].tolist()
+    out = []
+    for s in candidates:
+        try:
+            _ = f_get(PRICE_EP, {"symbol": s})
+            out.append(s)
+            if len(out) >= top_n:
+                break
+        except Exception:
+            continue
+
+    send_tg(f"📊 Universe (Auto-Top{top_n}): {', '.join(out[:10])}... (n={len(out)})")
+    return out
+
 
 
 def place_market(symbol, side, qty, positionSide=None):
