@@ -187,41 +187,68 @@ def signed(params:dict):
 
 def _request(method, url, *, params=None, data=None, signed_req=False, timeout=20):
     global _ban_until_ts
-    if params is None: params={}
-    if data is None: data={}
-    attempt=0; backoff=REST_BACKOFF_BASE
-    if time.time()<_ban_until_ts: time.sleep(max(0.1, min(REQ_SLEEP, _ban_until_ts - time.time())))
+    if params is None: params = {}
+    if data is None: data = {}
+    attempt = 0
+    backoff = REST_BACKOFF_BASE
+    if time.time() < _ban_until_ts:
+        time.sleep(max(0.1, min(REQ_SLEEP, _ban_until_ts - time.time())))
     while True:
         try:
-            if method=="GET":
-                if signed_req: u=url+"?"+signed(params); P=None
-                else: u=url; P=params
-                resp=session.get(u, params=P, timeout=timeout)
-            elif method=="DELETE":
-                resp=session.delete(url+"?"+signed(params or {}), timeout=timeout)
-            else:
-                payload=signed(data) if signed_req else data
-                resp=session.post(url, data=payload, timeout=timeout)
-
-            if resp.status_code in (418,429):
-                attempt+=1
-                try: j=resp.json(); code=j.get("code"); msg=j.get("msg","")
-                except Exception: code=None; msg=""
-                if attempt==1: send_tg(f"⏳ Binance ضغط/حظر مؤقت ({resp.status_code} [{code}] {msg}). سأخفف الطلبات.")
-                if attempt>=3:
-                    _ban_until_ts=time.time()+BAN_COOLDOWN_SEC; send_tg(f"🧊 إيقاف مؤقت لجميع الطلبات {BAN_COOLDOWN_SEC}s بسبب الحظر."); time.sleep(BAN_COOLDOWN_SEC)
+            if method == "GET":
+                if signed_req:
+                    u = url + "?" + signed(params)
+                    P = None
                 else:
-                    time.sleep(min(REST_BACKOFF_MAX, backoff*(1.7**attempt))+random.uniform(0,0.3))
-                continue
-            if resp.status_code>=400:
+                    u = url
+                    P = params
+                resp = session.get(u, params=P, timeout=timeout)
+            elif method == "DELETE":
+                resp = session.delete(url + "?" + signed(params or {}), timeout=timeout)
+            else:
+                payload = signed(data) if signed_req else data
+                resp = session.post(url, data=payload, timeout=timeout)
+
+            # معالجة حدود المعدل
+            if resp.status_code in (418, 429):
+                attempt += 1
                 try:
-                    j=resp.json(); code=j.get("code"); msg=j.get("msg")
+                    j = resp.json()
+                    code = j.get("code")
+                    msg  = j.get("msg", "")
+                except Exception:
+                    code = None
+                    msg = ""
+                if attempt == 1:
+                    send_tg(f"⏳ Binance ضغط/حظر مؤقت ({resp.status_code} [{code}] {msg}). سأخفف الطلبات.")
+                if attempt >= 3:
+                    _ban_until_ts = time.time() + BAN_COOLDOWN_SEC
+                    send_tg(f"🧊 إيقاف مؤقت لجميع الطلبات {BAN_COOLDOWN_SEC}s بسبب الحظر.")
+                    time.sleep(BAN_COOLDOWN_SEC)
+                else:
+                    time.sleep(min(REST_BACKOFF_MAX, backoff*(1.7**attempt)) + random.uniform(0, 0.3))
+                continue
+
+            # لوج تشخيصي عند أي 4xx/5xx
+            if resp.status_code >= 400:
+                body_preview = resp.text[:300] if hasattr(resp, "text") else ""
+                print("[HTTP ERR]", resp.status_code, "URL=", url, "params=", params or data, "body=", body_preview)
+                try:
+                    j = resp.json()
+                    code = j.get("code")
+                    msg  = j.get("msg")
                     raise requests.HTTPError(f"{resp.status_code} [{code}] {msg}", response=resp)
                 except ValueError:
                     resp.raise_for_status()
-            time.sleep(REQ_SLEEP); return resp.json()
+
+            time.sleep(REQ_SLEEP)
+            return resp.json()
+
         except (requests.Timeout, requests.ConnectionError):
-            attempt+=1; time.sleep(min(REST_BACKOFF_MAX, backoff*(1.5**attempt))+random.uniform(0,0.2)); continue
+            attempt += 1
+            time.sleep(min(REST_BACKOFF_MAX, backoff*(1.5**attempt)) + random.uniform(0, 0.2))
+            continue
+
 
 def f_get(url, params): return _request("GET", url, params=params)
 
