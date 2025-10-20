@@ -1,887 +1,733 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-MahdiBot v5 FINAL — Render (Auto-TopN + Strict Validation + Dynamic Trailing SL + Anti-418)
-USDT-M Futures PERPETUAL only — 4/5 fixed-consensus like previous version
-"""
-import os, time, hmac, hashlib, json, random, requests, pathlib, math
-import pandas as pd, numpy as np
-from decimal import Decimal, ROUND_DOWN
-from datetime import datetime, timezone, timedelta
+# MahdiBot v5 PRO — Conservative + Dual TF + Hourly Summary + Advanced Risk Add-ons (ALL Enabled)
+# ----------------------------------------------------------------------------------
+# هذا الإصدار يدمج كل الإضافات المقترحة:
+# - Auto-TopN بدون CSV + فلتر سيولة دنيا (MIN_QUOTEVOL_USDT)
+# - فلتر اتجاه بالفريم الأعلى 15m (EMA50/MACD-hist) + خيار EMA200
+# - 5 مؤشرات على 5m + إجماع 60%
+# - 3 أهداف TP (50%/30%/20%) + وقف متحرك ATR + Breakeven بعد TP1
+# - Trailing أقوى بعد TP2 (POST_TP2_TRAIL_MULT)
+# - حد أقصى للصفقات المتزامنة (MAX_CONCURRENT_TRADES)
+# - فترة تبريد بعد SL (SYMBOL_COOLDOWN_MIN) + منع إعادة الدخول (REENTRY_LOCK_BARS)
+# - فلتر تمويل (FUNDING_ABS_MAX)
+# - حد خسارة يومي (DAILY_LOSS_STOP_USDT أو DAILY_LOSS_STOP_PCT)
+# - ملخص كل ساعة + عدّادات + جدول Top-N
+# ----------------------------------------------------------------------------------
 
-# =======================================================
-# 🔧 تنظيف الرموز من أي محارف غريبة (ضمان رموز صالحة)
-# =======================================================
+import os, time, hmac, hashlib, math
+from datetime import datetime, timezone, date
+from typing import List, Dict, Any, Optional, Tuple
 
-import re  # مكتبة التعبيرات النمطية لتنظيف النصوص
+import requests
+import pandas as pd
+import numpy as np
+from dotenv import load_dotenv
 
-def _clean_symbol(s: str) -> str:
-    """
-    تنظف الرمز من أي محارف غير الأحرف الكبيرة A-Z أو الأرقام.
-    مثال:
-        " BTCUSDT " → "BTCUSDT"
-        " ETHUSDT\u200f" → "ETHUSDT"
-    """
-    # نحول إلى نص ونحذف أي شيء غير A-Z أو 0-9
-    return re.sub(r'[^A-Z0-9]', '', str(s).upper())
+# ===================== تحميل البيئة =====================
+load_dotenv()
 
-# ========= ENV =========
-API_KEY=os.getenv("API_KEY",""); API_SECRET=os.getenv("API_SECRET","")
-USE_TESTNET=os.getenv("USE_TESTNET","false").lower() in ("1","true","yes")
-RUN_MODE=os.getenv("RUN_MODE","live")
-INTERVAL=os.getenv("INTERVAL","5m")
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", os.getenv("TOP_N", "10")))
-SCAN_INTERVAL_SEC=int(os.getenv("SCAN_INTERVAL_SEC","120"))
-COOLDOWN_MIN=int(os.getenv("COOLDOWN_MIN","15"))
-KLINES_LIMIT=int(os.getenv("KLINES_LIMIT","200"))
-HEARTBEAT_MIN=int(os.getenv("HEARTBEAT_MIN","15") or os.getenv("TG_HEARTBEAT_MIN","15"))
-SYMBOLS_CSV=os.getenv("SYMBOLS_CSV","").strip()
-CONSENSUS_RATIO=float(os.getenv("CONSENSUS_RATIO","0.65"))
-MIN_AGREE=int(os.getenv("MIN_AGREE","2"))
-ADX_MIN=float(os.getenv("ADX_MIN","20"))
-ATR_PCT_MIN=float(os.getenv("ATR_PCT_MIN","0.0025"))
-TOTAL_CAPITAL_PCT=float(os.getenv("TOTAL_CAPITAL_PCT","0.40"))
-MAX_OPEN_TRADES=int(os.getenv("MAX_OPEN_TRADES","6"))
-NORMAL_TRADE_PCT=float(os.getenv("NORMAL_TRADE_PCT","0.05"))
-STRONG_TRADE_PCT=float(os.getenv("STRONG_TRADE_PCT","0.06"))
-STOP_LOSS_PCT_BASE=float(os.getenv("STOP_LOSS_PCT","0.009"))
-TP1_PCT=float(os.getenv("TP1_PCT","0.0035")); TP2_PCT=float(os.getenv("TP2_PCT","0.007")); TP3_PCT=float(os.getenv("TP3_PCT","0.012"))
-TP1_SHARE=float(os.getenv("TP1_SHARE","0.40")); TP2_SHARE=float(os.getenv("TP2_SHARE","0.35")); TP3_SHARE=float(os.getenv("TP3_SHARE","0.25"))
-BREAKEVEN_AFTER_TP1=os.getenv("BREAKEVEN_AFTER_TP1","true").lower() in ("1","true","yes")
-LOCK_AFTER_TP2_PCT=float(os.getenv("LOCK_AFTER_TP2_PCT","0.002"))
-STOP_LOSS_PCT_STRONG=float(os.getenv("STOP_LOSS_PCT_STRONG","0.012"))
-TP1_PCT_STRONG=float(os.getenv("TP1_PCT_STRONG","0.005")); TP2_PCT_STRONG=float(os.getenv("TP2_PCT_STRONG","0.010")); TP3_PCT_STRONG=float(os.getenv("TP3_PCT_STRONG","0.018"))
-TP_SHARES_STRONG=os.getenv("TP_SHARES_STRONG","0.35,0.35,0.30")
-TRAIL_ENABLE=os.getenv("TRAIL_ENABLE","true").lower() in ("1","true","yes")
-TRAIL_PCT=float(os.getenv("TRAIL_PCT","0.004")); TRAIL_ARM_AFTER=float(os.getenv("TRAIL_ARM_AFTER","0.006")); TRAIL_COOLDOWN_SEC=int(os.getenv("TRAIL_COOLDOWN_SEC","45"))
-TG_ENABLED=os.getenv("TG_ENABLED","true").lower() in ("1","true","yes")
-TG_TOKEN=os.getenv("TELEGRAM_TOKEN",""); TG_CHATID=os.getenv("TELEGRAM_CHAT_ID","")
-TG_NOTIFY_WEAK=os.getenv("TG_NOTIFY_WEAK","false").lower() in ("1","true","yes")
-TG_NOTIFY_UNIVERSE=os.getenv("TG_NOTIFY_UNIVERSE","true").lower() in ("1","true","yes")
-DAILY_LOSS_LIMIT_PCT=float(os.getenv("DAILY_LOSS_LIMIT_PCT","0.05"))
-DEFAULT_MARGIN_TYPE=os.getenv("MARGIN_TYPE","ISOLATED").upper()
-REST_BACKOFF_BASE=float(os.getenv("REST_BACKOFF_BASE","0.35")); REST_BACKOFF_MAX=float(os.getenv("REST_BACKOFF_MAX","8"))
-REQ_SLEEP=float(os.getenv("REQ_SLEEP","0.60")); BAN_COOLDOWN_SEC=int(os.getenv("BAN_COOLDOWN_SEC","420")); _ban_until_ts=0.0
-CACHE_TTL_SEC=int(os.getenv("CACHE_TTL_SEC","21600"))
-CACHE_PATH=pathlib.Path("/tmp/mahdi_valid_syms.json")
+API_KEY  = os.getenv("API_KEY", "")
+API_SECRET = os.getenv("API_SECRET", "")
+TG_TOKEN = os.getenv("TG_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
-BASE = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
-KLINES=f"{BASE}/fapi/v1/klines"; TICKER_24H=f"{BASE}/fapi/v1/ticker/24hr"; EXCHANGE_INFO=f"{BASE}/fapi/v1/exchangeInfo"
-PRICE_EP=f"{BASE}/fapi/v1/ticker/price"; BALANCE_EP=f"{BASE}/fapi/v2/balance"; POSITION_RISK_EP=f"{BASE}/fapi/v2/positionRisk"
-LEVERAGE_EP=f"{BASE}/fapi/v1/leverage"; MARGIN_TYPE_EP=f"{BASE}/fapi/v1/marginType"; DUAL_SIDE_EP=f"{BASE}/fapi/v1/positionSide/dual"
-ORDER_EP=f"{BASE}/fapi/v1/order"; ALL_OPEN_ORDERS=f"{BASE}/fapi/v1/allOpenOrders"; OPEN_ORDERS_EP=f"{BASE}/fapi/v1/openOrders"
-SERVER_TIME_EP=f"{BASE}/fapi/v1/time"; INCOME_EP=f"{BASE}/fapi/v1/income"; USER_TRADES_EP=f"{BASE}/fapi/v1/userTrades"
+USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() == "true"
+BASE_URL = os.getenv("BASE_URL") or ("https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com")
 
-session=requests.Session(); session.headers.update({"X-MBX-APIKEY":API_KEY,"User-Agent":"MahdiBot/5.0-final"})
+RUN_MODE = os.getenv("RUN_MODE", "paper").lower()  # paper | real
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "15"))
+INTERVAL = os.getenv("INTERVAL", "5m")              # الفريم الرئيسي
+HTF_INTERVAL = os.getenv("HTF_INTERVAL", "15m")      # الفريم الأعلى
+DEFAULT_MARGIN_TYPE = os.getenv("DEFAULT_MARGIN_TYPE", "ISOLATED").upper()
+LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 
-try:
-    from zoneinfo import ZoneInfo
-    TZ_RIYADH = ZoneInfo("Asia/Riyadh")
-except Exception:
-    TZ_RIYADH = timezone(timedelta(hours=3))
+# محافظ + نسب الإغلاق
+RISK_PROFILE = os.getenv("RISK_PROFILE", "conservative").lower()
+MAX_RISK_PCT   = float(os.getenv("MAX_RISK_PCT", "0.0035"))   # 0.35% من الرصيد
+STOP_ATR_MULT   = float(os.getenv("STOP_ATR_MULT", "1.3"))
+TRAIL_ATR_MULT  = float(os.getenv("TRAIL_ATR_MULT", "0.8"))
+TP1_R_MULT      = float(os.getenv("TP1_R_MULT", "0.9"))
+TP2_R_MULT      = float(os.getenv("TP2_R_MULT", "1.6"))
+TP3_R_MULT      = float(os.getenv("TP3_R_MULT", "2.3"))
+TP1_PCT_CLOSE   = float(os.getenv("TP1_PCT_CLOSE", "0.50"))
+TP2_PCT_CLOSE   = float(os.getenv("TP2_PCT_CLOSE", "0.30"))
+TP3_PCT_CLOSE   = float(os.getenv("TP3_PCT_CLOSE", "0.20"))
 
-def now_utc(): return datetime.now(timezone.utc)
-_last_action_time=now_utc(); _last_activity_desc="Startup"; _last_activity_ts_utc=_last_action_time; _watchdog_stage=0
-def mark_activity(event, detail=""):
-    global _last_action_time,_last_activity_desc,_last_activity_ts_utc
-    _last_action_time=now_utc(); _last_activity_ts_utc=_last_action_time; _last_activity_desc=event if not detail else f"{event}: {detail}"
-def fmt_both_times(ts_utc):
-    ts_local=ts_utc.astimezone(TZ_RIYADH); return ts_utc.strftime("%Y-%m-%d %H:%M:%S UTC"), ts_local.strftime("%Y-%m-%d %H:%M:%S Asia/Riyadh")
+# فلاتر إشارة
+CONSENSUS_MIN   = float(os.getenv("CONSENSUS_MIN", "0.6"))
+ADX_MIN         = float(os.getenv("ADX_MIN", "15"))
+RSI_BUY_MAX     = float(os.getenv("RSI_BUY_MAX", "70"))
+RSI_SELL_MIN    = float(os.getenv("RSI_SELL_MIN", "30"))
+MIN_ATR_PCT     = float(os.getenv("MIN_ATR_PCT", "0.20"))
 
-def _D(x): return Decimal(str(x))
-def floor_to_step(v, step):
-    v=_D(v); s=_D(step); n=(v/s).to_integral_value(rounding=ROUND_DOWN); q=(n*s)
-    if q<=0: q=s
-    return str(q.normalize())
-def price_to_tick(price, tick): return floor_to_step(price, tick)
-def qty_to_step(qty, lot_step, min_qty):
-    q=_D(floor_to_step(qty, lot_step)); mq=_D(str(min_qty))
-    if q<mq: q=mq
-    return str(q.normalize())
+# إضافات متقدمة (مفعّلة افتراضيًا)
+BREAKEVEN_AFTER_TP1 = os.getenv("BREAKEVEN_AFTER_TP1", "true").lower() == "true"
+BE_OFFSET_MULT      = float(os.getenv("BE_OFFSET_MULT", "0.05"))  # 0.05 * ATR فوق/تحت الدخول
+POST_TP2_TRAIL_MULT = float(os.getenv("POST_TP2_TRAIL_MULT", "1.3"))
+MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "4"))
+SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "30"))
+REENTRY_LOCK_BARS   = int(os.getenv("REENTRY_LOCK_BARS", "5"))
+MIN_QUOTEVOL_USDT   = float(os.getenv("MIN_QUOTEVOL_USDT", "5e7"))  # 50M
+EMA200_FILTER       = os.getenv("EMA200_FILTER", "true").lower() == "true"
+FUNDING_ABS_MAX     = float(os.getenv("FUNDING_ABS_MAX", "0.0005"))  # 0.05%
+DAILY_LOSS_STOP_USDT= float(os.getenv("DAILY_LOSS_STOP_USDT", "-999999"))  # عطّل إذا كبير جدًا
+DAILY_LOSS_STOP_PCT = float(os.getenv("DAILY_LOSS_STOP_PCT", "-100.0"))   # عطّل إذا -100%
 
-# مضاد سبام لتليجرام + تهدئة + دمج التكرارات
-_tg_last_ts = 0.0
-_tg_last_msg = ""
-_tg_dup_count = 0
+SYMBOLS_CSV = os.getenv("SYMBOLS_CSV", "").strip()
 
-def send_tg(text: str):
-    global _tg_last_ts, _tg_last_msg, _tg_dup_count
+# ===================== مسارات Binance =====================
+EXCHANGE_INFO = f"{BASE_URL}/fapi/v1/exchangeInfo"
+TICKER_24H    = f"{BASE_URL}/fapi/v1/ticker/24hr"
+KLINES_EP     = f"{BASE_URL}/fapi/v1/klines"
+PRICE_EP      = f"{BASE_URL}/fapi/v1/ticker/price"
+BALANCE_EP    = f"{BASE_URL}/fapi/v2/balance"
+LEVERAGE_EP   = f"{BASE_URL}/fapi/v1/leverage"
+MARGIN_TYPE_EP= f"{BASE_URL}/fapi/v1/marginType"
+ORDER_EP      = f"{BASE_URL}/fapi/v1/order"
+OPEN_ORDERS   = f"{BASE_URL}/fapi/v1/openOrders"
+FUNDING_EP    = f"{BASE_URL}/fapi/v1/premiumIndex"
 
-    if not (TG_ENABLED and TG_TOKEN and TG_CHATID):
-        print("[TG SKIP]", text[:120])
-        return
+SESSION = requests.Session()
+SESSION.headers.update({"Content-Type": "application/json"})
 
+# ===================== عدّادات الجلسة =====================
+METRICS = {"signals": 0, "trades": 0, "tp_hits": 0, "sl_hits": 0, "realized_pnl": 0.0}
+_last_summary_ts = 0.0
+SUMMARY_EVERY_SEC = int(os.getenv("SUMMARY_EVERY_SEC", str(60*60)))
+_session_day = date.today()
+_session_start_balance = None
+
+# ====== عرض تفاصيل قائمة الأزواج المختارة (Top-N) إلى تيليجرام ======
+
+def _fmt_qv(x: float) -> str:
     try:
-        # دمج الرسائل المتكررة (لنفس النص) حتى لا نغرق بالسبام
-        if text == _tg_last_msg:
-            _tg_dup_count += 1
-            # تجميع أول 3 تكرارات وعدم إرسالها
-            if _tg_dup_count <= 3:
-                return
-            # في التكرار الرابع نرسل مع عداد xN ثم نصفر العداد
-            text = f"{text} (x{_tg_dup_count})"
-            _tg_dup_count = 0
-        else:
-            _tg_last_msg = text
-            _tg_dup_count = 0
-
-        # تهدئة بسيطة: 1 رسالة كل ~1.5 ثانية
-        now = time.time()
-        wait = 1.5 - (now - _tg_last_ts)
-        if wait > 0:
-            time.sleep(wait)
-        _tg_last_ts = time.time()
-
-        r = session.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={
-                "chat_id": TG_CHATID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        )
-
-        # التعامل مع 429 من تيليجرام
-        if r.status_code == 429:
-            try:
-                j = r.json()
-                ra = int(j.get("parameters", {}).get("retry_after", 5))
-            except Exception:
-                ra = 5
-
-            # لا نوقف البوت لساعات طويلة؛ نطبع ونكتفي بهدوء قصير
-            cap = 60  # ثوانٍ
-            if ra > cap:
-                print(f"[TG 429] retry_after={ra}s (سأتجاهل النوم الطويل وأكتفي بتهدئة قصيرة)")
-                time.sleep(5)
-            else:
-                print(f"[TG 429] النوم {ra}s")
-                time.sleep(ra + 1)
-            return
-
-        if r.status_code >= 400:
-            print("[TG ERR]", r.status_code, r.text[:200])
-
-    except Exception as e:
-        print("[TG EXC]", e)
-
-# ---- server time sync (مهم) ----
-_time_offset_ms = 0
-def sync_server_time():
-    global _time_offset_ms
-    try:
-        r = session.get(SERVER_TIME_EP, timeout=10)
-        r.raise_for_status()
-        srv = int(r.json()["serverTime"])
-        loc = int(time.time() * 1000)
-        _time_offset_ms = srv - loc
-    except Exception as e:
-        print("[TIME WARN]", e)
-
-def signed(params:dict):
-    ts=int(time.time()*1000 + _time_offset_ms); params["timestamp"]=ts; params.setdefault("recvWindow",60000)
-    q="&".join([f"{k}={params[k]}" for k in sorted(params)]); sig=hmac.new(API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
-    return q+f"&signature={sig}"
-
-def _request(method, url, *, params=None, data=None, signed_req=False, timeout=20):
-    global _ban_until_ts
-    if params is None: params = {}
-    if data is None: data = {}
-    attempt = 0
-    backoff = REST_BACKOFF_BASE
-    if time.time() < _ban_until_ts:
-        time.sleep(max(0.1, min(REQ_SLEEP, _ban_until_ts - time.time())))
-    while True:
-        try:
-            if method == "GET":
-                if signed_req:
-                    u = url + "?" + signed(params)
-                    P = None
-                else:
-                    u = url
-                    P = params
-                resp = session.get(u, params=P, timeout=timeout)
-            elif method == "DELETE":
-                resp = session.delete(url + "?" + signed(params or {}), timeout=timeout)
-            else:
-                payload = signed(data) if signed_req else data
-                resp = session.post(url, data=payload, timeout=timeout)
-
-            # معالجة حدود المعدل
-            if resp.status_code in (418, 429):
-                attempt += 1
-                try:
-                    j = resp.json()
-                    code = j.get("code")
-                    msg  = j.get("msg", "")
-                except Exception:
-                    code = None
-                    msg = ""
-                if attempt == 1:
-                    send_tg(f"⏳ Binance ضغط/حظر مؤقت ({resp.status_code} [{code}] {msg}). سأخفف الطلبات.")
-                if attempt >= 3:
-                    _ban_until_ts = time.time() + BAN_COOLDOWN_SEC
-                    send_tg(f"🧊 إيقاف مؤقت لجميع الطلبات {BAN_COOLDOWN_SEC}s بسبب الحظر.")
-                    time.sleep(BAN_COOLDOWN_SEC)
-                else:
-                    time.sleep(min(REST_BACKOFF_MAX, backoff*(1.7**attempt)) + random.uniform(0, 0.3))
-                continue
-
-            # لوج تشخيصي عند أي 4xx/5xx
-            if resp.status_code >= 400:
-                body_preview = resp.text[:300] if hasattr(resp, "text") else ""
-                print("[HTTP ERR]", resp.status_code, "URL=", url, "params=", params or data, "body=", body_preview)
-                try:
-                    j = resp.json()
-                    code = j.get("code")
-                    msg  = j.get("msg")
-                    raise requests.HTTPError(f"{resp.status_code} [{code}] {msg}", response=resp)
-                except ValueError:
-                    resp.raise_for_status()
-
-            time.sleep(REQ_SLEEP)
-            return resp.json()
-
-        except (requests.Timeout, requests.ConnectionError):
-            attempt += 1
-            time.sleep(min(REST_BACKOFF_MAX, backoff*(1.5**attempt)) + random.uniform(0, 0.2))
-            continue
-
-
-def f_get(url, params): return _request("GET", url, params=params)
-
-_info_cache={}
-def symbol_filters(symbol):
-    if symbol in _info_cache: return _info_cache[symbol]
-    data=f_get(EXCHANGE_INFO, {"symbol":symbol})
-    fs=data["symbols"][0]["filters"]
-    lot=float([f for f in fs if f["filterType"]=="LOT_SIZE"][0]["stepSize"]); minq=float([f for f in fs if f["filterType"]=="LOT_SIZE"][0]["minQty"])
-    tick=float([f for f in fs if f["filterType"]=="PRICE_FILTER"][0]["tickSize"]); _info_cache[symbol]={"lot_step":lot,"min_qty":minq,"tick_size":tick}
-    return _info_cache[symbol]
-
-def account_balance_usdt():
-    data=_request("GET", BALANCE_EP, signed_req=True)
-    for x in data:
-        if x["asset"]=="USDT": return float(x["balance"])
-    return 0.0
-
-def is_hedge_mode():
-    try:
-        j=_request("GET", DUAL_SIDE_EP, signed_req=True)
-        return bool(j.get("dualSidePosition"))
+        x = float(x)
+        if x >= 1e9: return f"{x/1e9:.2f}B"
+        if x >= 1e6: return f"{x/1e6:.2f}M"
+        if x >= 1e3: return f"{x/1e3:.2f}K"
+        return f"{x:.0f}"
     except Exception:
-        return False
+        return str(x)
 
-def ensure_leverage(symbol, lev):
-    try: _request("POST", LEVERAGE_EP, signed_req=True, data={"symbol":symbol,"leverage":lev})
-    except Exception: pass
 
-def ensure_margin_type(symbol, mt):
-    mt=mt.upper()
-    if mt not in ("ISOLATED","CROSS"): return
-    try: _request("POST", MARGIN_TYPE_EP, signed_req=True, data={"symbol":symbol,"marginType":mt})
-    except requests.HTTPError as e:
-        if "4048" in str(e): send_tg(f"⚠️ لا يمكن تغيير هامش <b>{symbol}</b> إلى {mt} لوجود صفقات/أوامر مفتوحة.")
-
-def get_klines(symbol, interval="5m", limit=200):
+def send_universe_details(symbols: List[str]) -> None:
     try:
-        data = f_get(KLINES, {"symbol": symbol, "interval": interval, "limit": limit})
-    except requests.HTTPError as he:
-        # تجاوز الرمز إن كان Invalid symbol
-        if "-1121" in str(he) or "Invalid symbol" in str(he):
-            send_tg(f"⚠️ {symbol}: Invalid symbol — تمّ تجاوزه.")
-            return None
-        # أي خطأ آخر: أعِد رفعه
-        raise
-    cols = ["open_time","open","high","low","close","volume","close_time","q","t","tb","tq","i"]
-    df = pd.DataFrame(data, columns=cols)
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
-    return df
-
-
-def get_live_price(symbol): j=f_get(PRICE_EP, {"symbol":symbol}); return float(j["price"])
-
-def ema(s,n): return s.ewm(span=n, adjust=False).mean()
-def rsi(s,n=14):
-    d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0); rs=up.rolling(n).mean()/(dn.rolling(n).mean()+1e-9)
-    return 100-(100/(1+rs))
-def macd(s,fast=12,slow=26,signal=9):
-    f=ema(s,fast); sl=ema(s,slow); m=f-sl; sg=ema(m,signal); return m,sg,m-sg
-def atr(df,n=14):
-    h,l,c=df["high"],df["low"],df["close"]; pc=c.shift(1)
-    tr=pd.concat([(h-l).abs(),(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1); return tr.rolling(n).mean()
-def adx(df,n=14):
-    h,l,c=df["high"],df["low"],df["close"]; plus=(h-h.shift(1)).clip(lower=0); minus=(l.shift(1)-l).clip(lower=0)
-    tr=atr(df,n)*n; p=100*(plus.rolling(n).sum()/(tr+1e-9)); m=100*(minus.rolling(n).sum()/(tr+1e-9))
-    dx=((p-m).abs()/((p+m)+1e-9))*100; return dx.rolling(n).mean()
-def supertrend(df, period=10, mult=3.0):
-    hl2=(df["high"]+df["low"])/2.0; _atr=atr(df, period); upper=hl2+mult*_atr; lower=hl2-mult*_atr
-    st=pd.Series(index=df.index, dtype=float); dir_up=True
-    for i in range(len(df)):
-        if i==0:
-            st.iloc[i]=upper.iloc[i]; dir_up=True; continue
-        if df["close"].iloc[i]>st.iloc[i-1]: dir_up=True
-        elif df["close"].iloc[i]<st.iloc[i-1]: dir_up=False
-        st.iloc[i]= lower.iloc[i] if dir_up else upper.iloc[i]
-    return pd.Series(np.where(df["close"]>st,"BUY","SELL"), index=df.index)
-def vwap(df, window=50):
-    tp=(df["high"]+df["low"]+df["close"])/3.0; vol=df["volume"]
-    rv=(tp*vol).rolling(window).sum()/(vol.rolling(window).sum()+1e-9); close=df["close"]; diff=(close-rv)/rv
-    return pd.Series(np.where(diff>0.0005,"BUY", np.where(diff<-0.0005,"SELL","HOLD")), index=df.index)
-
-def indicator_votes(df):
-    close=df["close"]; votes={}
-    f=ema(close,21); s=ema(close,50); votes["EMA"]="BUY" if f.iloc[-1]>s.iloc[-1] else "SELL" if f.iloc[-1]<s.iloc[-1] else "HOLD"
-    m,sg,_=macd(close); votes["MACD"]="BUY" if m.iloc[-1]>sg.iloc[-1] else "SELL" if m.iloc[-1]<sg.iloc[-1] else "HOLD"
-    r=rsi(close,14).iloc[-1]; votes["RSI"]="SELL" if r>70 else "BUY" if r<30 else "HOLD"
-    votes["SUPERTREND"]=supertrend(df).iloc[-1]; votes["VWAP"]=vwap(df).iloc[-1]
-    _atr=atr(df,14).iloc[-1]; _adx=adx(df,14).iloc[-1]; last=close.iloc[-1]; atr_pct=float(_atr/last) if last>0 else 0.0
-    return votes, float(last), float(_adx), float(_atr), atr_pct
-
-def fixed_consensus(votes, adx_v, atr_pct):
-    if adx_v<ADX_MIN or atr_pct<ATR_PCT_MIN: return "HOLD", 0.0, 0
-    buys=sum(1 for v in votes.values() if v=="BUY"); sells=sum(1 for v in votes.values() if v=="SELL")
-    if buys==sells: return "HOLD", 0.0, 0
-    direction="BUY" if buys>sells else "SELL"
-    agree=sum(1 for v in votes.values() if v==direction); ratio=agree/5.0
-    if agree>=4 and ratio>=CONSENSUS_RATIO: return direction, ratio, agree
-    return "HOLD", ratio, agree
-
-def fetch_valid_perp_usdt():
-    try:
-        if CACHE_TTL_SEC>0 and CACHE_PATH.exists():
-            j=json.loads(CACHE_PATH.read_text())
-            if time.time()-j.get("ts",0)<CACHE_TTL_SEC: return set(j.get("symbols",[]))
-    except Exception: pass
-    data=_request("GET", EXCHANGE_INFO, params={}, signed_req=False)
-    valid={ s["symbol"] for s in data.get("symbols",[]) if s.get("status")=="TRADING" and s.get("quoteAsset")=="USDT" and s.get("contractType")=="PERPETUAL" }
-    try:
-        if CACHE_TTL_SEC>0: CACHE_PATH.write_text(json.dumps({"ts":time.time(),"symbols":sorted(valid)}))
-    except Exception: pass
-    return valid
-
-def build_auto_universe():
-    valid=fetch_valid_perp_usdt()
-    tickers=f_get(TICKER_24H, {"type":"FULL"}); df=pd.DataFrame(tickers); df=df[df["symbol"].isin(valid)].copy()
-    if df.empty: return []
-    df["quoteVolume"]=pd.to_numeric(df["quoteVolume"], errors="coerce").fillna(0.0)
-    candidates=df.sort_values("quoteVolume", ascending=False)["symbol"].tolist()
-    final=[]
-    for s in candidates:
-        if len(final)>=MAX_SYMBOLS: break
-        try: _=f_get(PRICE_EP, {"symbol":s}); final.append(s)
-        except requests.HTTPError as he:
-            if "-1121" in str(he) or "Invalid symbol" in str(he): continue
-        except Exception: continue
-    return final
-
-def load_universe(top_n: int | None = None) -> list:
-    """
-    يبني قائمة الأزواج (USDT-PERP فقط) من ملف CSV إن وُجد، وإلا يعتمد Auto-TopN.
-    يحترم MAX_SYMBOLS من البيئة عندما لا يُمرَّر top_n.
-    """
-    # احترم MAX_SYMBOLS إذا لم يُمرَّر top_n
-    try:
-        max_symbols = int(os.getenv("MAX_SYMBOLS", "10"))
-    except Exception:
-        max_symbols = 10
-
-    if top_n is None or int(top_n) <= 0:
-        top_n = max_symbols
-    else:
-        top_n = int(top_n)
-
-    # 1) الرموز المسموحة: USDT-PERP (FUTURES)
-    valid = fetch_valid_perp_usdt()
-    out: list[str] = []
-
-    # 2) إن كان هناك CSV مفعَّل، حاوِل استخدامه أولاً
-    if SYMBOLS_CSV:
-        try:
-            try:
-                df = pd.read_csv(SYMBOLS_CSV)  # قد يحتوي عمود "symbol"
-                col = "symbol" if "symbol" in df.columns else df.columns[0]
-                syms = [str(s).strip().upper() for s in df[col] if str(s).strip()]
-            except Exception:
-                df = pd.read_csv(SYMBOLS_CSV, header=None, names=["symbol"])  # بدون عناوين
-                syms = [str(s).strip().upper() for s in df["symbol"] if str(s).strip()]
-
-            syms = [s for s in syms if s in valid]  # فلترة حسب الـ FUTURES المسموحة
-
-            for s in syms:
-                try:
-                    _ = f_get(PRICE_EP, {"symbol": s})  # تأكيد أنه قابل للتسعير
-                    out.append(s)
-                    if len(out) >= top_n:
-                        break
-                except Exception:
-                    continue
-
-            if out:
-                send_tg(f"📊 Universe من CSV: {', '.join(out[:10])}... (n={len(out)})")
-                # DEBUG
-                send_tg(
-                    f"[DEBUG] valid_count={len(valid)} | BTCUSDT in valid? { 'BTCUSDT' in valid } | "
-                    f"ETHUSDT in valid? { 'ETHUSDT' in valid }"
-                )
-                return out
-        except Exception as e:
-            send_tg(f"⚠️ تعذر قراءة CSV: {e}")
-
-    # 3) السقوط إلى Auto-TopN (حسب أعلى quoteVolume)
-    try:
-        tickers = f_get(TICKER_24H, {"type": "FULL"})
-        df = pd.DataFrame(tickers)
-        df = df[df["symbol"].isin(valid)].copy()
+        data = f_get(TICKER_24H)
+        df = pd.DataFrame(data)
         if df.empty:
-            send_tg("⚠️ لا مرشحين بعد الفلترة — سأعيد المحاولة.")
-            return []
-
-        df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce").fillna(0.0)
-        candidates = df.sort_values("quoteVolume", ascending=False)["symbol"].tolist()
-
-        for s in candidates:
-            try:
-                _ = f_get(PRICE_EP, {"symbol": s})
-                out.append(s)
-                if len(out) >= top_n:
-                    break
-            except Exception:
-                continue
-
-        send_tg(f"📊 Universe (Auto-Top{top_n}): {', '.join(out[:10])}... (n={len(out)})")
-        # DEBUG
-        send_tg(
-            f"[DEBUG] valid_count={len(valid)} | BTCUSDT in valid? { 'BTCUSDT' in valid } | "
-            f"ETHUSDT in valid? { 'ETHUSDT' in valid }"
-        )
-        return out
-    except Exception as e:
-        send_tg(f"⚠️ فشل بناء Universe تلقائيًا: {e}")
-        return []
-
-def place_market(symbol, side, qty, positionSide=None):
-    f=symbol_filters(symbol); qty_str=qty_to_step(qty, f["lot_step"], f["min_qty"])
-    p={"symbol":symbol,"side":side,"type":"MARKET","quantity":qty_str}
-    if positionSide: p["positionSide"]=positionSide
-    return _request("POST", ORDER_EP, signed_req=True, data=p)
-
-def list_open_orders(symbol):
-    try: return _request("GET", OPEN_ORDERS_EP, params={"symbol":symbol}, signed_req=True)
-    except Exception: return []
-def cancel_order(symbol, order_id):
-    try: _request("DELETE", ORDER_EP, params={"symbol":symbol,"orderId":order_id}, signed_req=True)
-    except Exception: pass
-def cancel_existing_stop(symbol):
-    for o in list_open_orders(symbol):
-        try:
-            if o.get("type")=="STOP_MARKET" and str(o.get("closePosition","false")).lower()=="true":
-                cancel_order(symbol, o.get("orderId")); time.sleep(REQ_SLEEP)
-        except Exception: continue
-
-def fmt_price(x):
-    try: return f"{float(x):.8f}".rstrip("0").rstrip(".")
-    except Exception: return str(x)
-
-def send_entry_alert(symbol, side, entry, qty, lev, tps, sl):
-    emoji="🟢 LONG دخول ✅" if side=="BUY" else "🔴 SHORT دخول ✅"
-    send_tg(f"{emoji}\n<b>{symbol}</b> | Entry {fmt_price(entry)} | SL {fmt_price(sl)}\nTP1:{tps[0]*100:.2f}% | TP2:{tps[1]*100:.2f}% | TP3:{tps[2]*100:.2f}%\nQty {float(qty):.8f} | Lev {lev}x")
-
-def user_trades(symbol, start_ms):
-    out=[]; s=start_ms
-    while True:
-        data=_request("GET", USER_TRADES_EP, params={"symbol":symbol,"startTime":int(s),"limit":1000}, signed_req=True)
-        if not isinstance(data,list) or not data: break
-        out.extend(data); last=max(int(t["time"]) for t in data)
-        if len(data)<1000: break
-        s=last+1
-    return out
-
-def income_sum(symbol, start_ms, end_ms):
-    realized=0.0; fees=0.0; s=start_ms
-    while True:
-        data=_request("GET", INCOME_EP, params={"symbol":symbol or None, "startTime":int(s), "endTime":int(end_ms), "limit":1000}, signed_req=True)
-        if not isinstance(data,list) or not data: break
-        for it in data:
-            t=it.get("incomeType"); v=float(it.get("income",0.0))
-            if t=="REALIZED_PNL": realized+=v
-            elif t=="COMMISSION": fees+=v
-        last=max(int(it["time"]) for it in data)
-        if last>=end_ms or len(data)<1000: break
-        s=last+1
-    return realized, fees
-
-state={}; _prev_open=set()
-def open_positions():
-    try: data=_request("GET", POSITION_RISK_EP, signed_req=True)
-    except Exception: return {}
-    pos={}
-    for p in data:
-        q=float(p["positionAmt"])
-        if abs(q)>1e-12: pos[p["symbol"]]=q
-    return pos
-
-def calc_order_qty(symbol, price, leverage, strong):
-    bal=account_balance_usdt(); cap_pct=STRONG_TRADE_PCT if (leverage==10 or strong) else NORMAL_TRADE_PCT
-    notional=bal*cap_pct*leverage; raw_qty=notional/price; f=symbol_filters(symbol); qty_str=qty_to_step(raw_qty, f["lot_step"], f["min_qty"])
-    return Decimal(qty_str)
-
-def place_tp3_sl(symbol, side, entry, qty, posSide, strong):
-    if strong:
-        tps=(TP1_PCT_STRONG,TP2_PCT_STRONG,TP3_PCT_STRONG)
-        try: s1,s2,s3=[float(x.strip()) for x in TP_SHARES_STRONG.split(",")]
-        except Exception: s1,s2,s3=0.35,0.35,0.30
-        shares=(s1,s2,s3); sl_pct=STOP_LOSS_PCT_STRONG; lock_pct=max(LOCK_AFTER_TP2_PCT,0.003)
-    else:
-        tps=(TP1_PCT,TP2_PCT,TP3_PCT); shares=(TP1_SHARE,TP2_SHARE,TP3_SHARE); sl_pct=STOP_LOSS_PCT_BASE; lock_pct=LOCK_AFTER_TP2_PCT
-    f=symbol_filters(symbol); tick=f["tick_size"]; lot=f["lot_step"]; minq=f["min_qty"]; is_buy=(side=="BUY")
-    def price_for(pct):
-        raw=entry*(1+pct) if is_buy else entry*(1-pct); return price_to_tick(max(raw, float(tick)), tick)
-    tp_prices=[price_for(tps[0]), price_for(tps[1]), price_for(tps[2])]; sl_price=price_for(sl_pct)
-    from decimal import Decimal as D
-    tp_qtys=[ qty_to_step(D(str(qty))*D(str(shares[i])), lot, minq) for i in range(3) ]
-    tp_side="SELL" if is_buy else "BUY"; posS=("LONG" if is_buy else "SHORT") if posSide else None
-    for pr,qt,closepos in [(tp_prices[0],tp_qtys[0],False),(tp_prices[1],tp_qtys[1],False),(tp_prices[2],None,True)]:
-        d={"symbol":symbol,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":pr,"workingType":"MARK_PRICE"}
-        if closepos: d["closePosition"]="true"
-        else: d["quantity"]=qt; d["reduceOnly"]="true"
-        if posS: d["positionSide"]=posS
-        _request("POST", ORDER_EP, signed_req=True, data=d)
-    sp={"symbol":symbol,"side":tp_side,"type":"STOP_MARKET","stopPrice":sl_price,"closePosition":"true","workingType":"MARK_PRICE"}
-    if posS: sp["positionSide"]=posS
-    _request("POST", ORDER_EP, signed_req=True, data=sp)
-    return tps, tp_prices, sl_pct, sl_price, lock_pct, shares
-
-def detect_tp_fills(symbol):
-    st=state.get(symbol)
-    if not st: return
-    start_ms=st["open_ts_ms"]-60_000; trades=user_trades(symbol, start_ms)
-    if not trades: return
-    close_side="SELL" if st["side"]=="BUY" else "BUY"; fills=[t for t in trades if int(t["time"])>=st["open_ts_ms"] and t.get("side")==close_side]
-    if not fills: return
-    def fqty(t): return float(t["qty"])
-    def fpr(t): return float(t["price"])
-    lot=st["lot_step"]; minq=st["min_qty"]; from decimal import Decimal as D
-    tp1_target=float(qty_to_step(D(str(st["qty"]))*D(str(st["shares"][0])), lot, minq)); tp2_target=float(qty_to_step(D(str(st["qty"]))*D(str(st["shares"][1])), lot, minq))
-    total_closed=sum(fqty(t) for t in fills)
-    if (not st.get("tp1_done")) and total_closed+1e-12>=tp1_target:
-        acc=0.0; vwap=0.0
-        for t in sorted(fills, key=lambda x: x["time"]):
-            q=fqty(t); p=fpr(t); take=min(q, tp1_target-acc); vwap+=p*take; acc+=take
-            if acc>=tp1_target-1e-12: break
-        if acc>0:
-            exec_px=vwap/acc; st["tp1_done"]=True; st["tp1_price"]=exec_px
-            send_tg(f"🎯 TP1 تنفيذ فعلي <b>{symbol}</b>\nسعر التنفيذ: {fmt_price(exec_px)} | كمية≈ {tp1_target:.8f}")
-            mark_activity("TP1 filled", f"{symbol} exec≈{fmt_price(exec_px)}")
-            if BREAKEVEN_AFTER_TP1:
-                try:
-                    cancel_existing_stop(symbol); is_buy=(st["side"]=="BUY"); f=symbol_filters(symbol); tick=f["tick_size"]
-                    def price_for(pct): raw=st["entry"]*(1+pct) if is_buy else st["entry"]*(1-pct); return price_to_tick(max(raw, float(tick)), tick)
-                    tp2_price=price_for(st["tps"][1]); tp3_price=price_for(st["tps"][2]); be_price=price_to_tick(st["entry"], tick); tp_side="SELL" if is_buy else "BUY"
-                    common={"symbol":symbol,"workingType":"MARK_PRICE"}
-                    if st["positionSide"]: common["positionSide"]=st["positionSide"]
-                    from decimal import Decimal as D2
-                    tp2_qty=qty_to_step(D2(str(st["qty"]))*D2(str(st["shares"][1])), f["lot_step"], f["min_qty"])
-                    _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":tp2_price,"quantity":tp2_qty,"reduceOnly":"true"})
-                    _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":tp3_price,"closePosition":"true"})
-                    _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"STOP_MARKET","stopPrice":be_price,"closePosition":"true"})
-                    send_tg("🛡️ تم تحويل SL إلى Breakeven ووضع TP2/TP3 للباقي")
-                except Exception as e: send_tg(f"⚠️ لم أستطع تعديل الأوامر بعد TP1: {e}")
-    if st.get("tp1_done") and (not st.get("tp2_done")) and total_closed+1e-12>=(tp1_target+tp2_target):
-        st["tp2_done"]=True
-        try:
-            cancel_existing_stop(symbol); is_buy=(st["side"]=="BUY"); f=symbol_filters(symbol); tick=f["tick_size"]
-            def price_for(pct): raw=st["entry"]*(1+pct) if is_buy else st["entry"]*(1-pct); return price_to_tick(max(raw, float(tick)), tick)
-            tp3_price=price_for(st["tps"][2]); common={"symbol":symbol,"workingType":"MARK_PRICE"}; tp_side="SELL" if is_buy else "BUY"
-            if st["positionSide"]: common["positionSide"]=st["positionSide"]
-            _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"TAKE_PROFIT_MARKET","stopPrice":tp3_price,"closePosition":"true"})
-            lock_pct=st["lock_pct"]; lock_price=price_for(lock_pct if is_buy else -lock_pct)
-            _request("POST", ORDER_EP, signed_req=True, data={**common,"side":tp_side,"type":"STOP_MARKET","stopPrice":lock_price,"closePosition":"true"})
-            send_tg(f"🔒 تشديد SL بعد TP2 إلى {('+' if is_buy else '-')}{lock_pct*100:.2f}%"); mark_activity("TP2 filled", f"{symbol} lock={lock_pct*100:.2f}%")
-        except Exception as e: send_tg(f"⚠️ لم أستطع تشديد SL بعد TP2: {e}")
-
-def trailing_manager():
-    if not TRAIL_ENABLE:
-        return
-    for symbol, st in list(state.items()):
-        try:
-            price = get_live_price(symbol)
-            is_long = (st["side"] == "BUY")
-            entry = st["entry"]
-            f = symbol_filters(symbol)
-            tick = f["tick_size"]
-            now = time.time()
-            st.setdefault("trail_max", entry)
-            st.setdefault("trail_min", entry)
-            st.setdefault("trail_armed", False)
-            st.setdefault("last_trail_update_ts", 0.0)
-            st.setdefault("last_sl_price", None)
-            pnl_pct = (price / entry - 1.0) if is_long else (1.0 - price / entry)
-            if (not st["trail_armed"]) and (st.get("tp1_done") or pnl_pct >= TRAIL_ARM_AFTER):
-                st["trail_armed"] = True
-                send_tg(f"🛰️ تفعيل Trailing SL على <b>{symbol}</b> (pnl≈ {pnl_pct*100:.2f}%)")
-            if not st["trail_armed"]:
-                continue
-            if is_long:
-                if price > st["trail_max"]:
-                    st["trail_max"] = price
-                desired = max(st["trail_max"] * (1.0 - TRAIL_PCT), entry)
-            else:
-                if price < st["trail_min"]:
-                    st["trail_min"] = price
-                desired = min(st["trail_min"] * (1.0 + TRAIL_PCT), entry)
-            desired = float(price_to_tick(desired, tick))
-            if st["last_sl_price"] is None or (is_long and desired > st["last_sl_price"]) or ((not is_long) and desired < st["last_sl_price"]):
-                if now - st["last_trail_update_ts"] >= TRAIL_COOLDOWN_SEC:
-                    try:
-                        cancel_existing_stop(symbol)
-                    except Exception:
-                        pass
-                    tp_side = "SELL" if is_long else "BUY"
-                    data = {
-                        "symbol": symbol,
-                        "side": tp_side,
-                        "type": "STOP_MARKET",
-                        "stopPrice": fmt_price(desired),
-                        "closePosition": "true",
-                        "workingType": "MARK_PRICE"
-                    }
-                    if st.get("positionSide"):
-                        data["positionSide"] = st["positionSide"]
-                    _request("POST", ORDER_EP, signed_req=True, data=data)
-                    st["last_trail_update_ts"] = now
-                    st["last_sl_price"] = desired
-                    send_tg(f"📍 تحديث Trailing SL <b>{symbol}</b> → {fmt_price(desired)}")
-                    mark_activity("Trail update", f"{symbol} SL={fmt_price(desired)}")
-        except Exception:
-            continue
-
-
-def scan_once(symbols):
-    hits = 0
-    errors = 0
-    signals = []
-
-    # نجلب قائمة رموز USDT-M PERPETUAL المتاحة الآن مرة واحدة
-    valid = fetch_valid_perp_usdt()
-
-    for sym in list(symbols):
-        # تنظيف وتوحيد شكل الرمز
-        sym = str(sym).strip().upper()
-
-        # فلترة سريعة قبل أي طلب شبكة
-        if sym not in valid:
-            send_tg(f"⚠️ {repr(sym)}: ليس ضمن USDT-M PERPETUAL المتاحة الآن — استبعدته.")
-            continue
-
-        try:
-            # لوج تشخيصي
-            print("[SCAN] symbol =", repr(sym))
-
-            # قد ترجع None لو كان Invalid symbol (من get_klines المعدّلة)
-            df = get_klines(sym, INTERVAL, KLINES_LIMIT)
-            if df is None or len(df) < 60:
-                time.sleep(max(REQ_SLEEP, 0.12))
-                continue
-
-            votes, last, adx_v, atr_v, atr_pct = indicator_votes(df)
-            direction, ratio, agree = fixed_consensus(votes, adx_v, atr_pct)
-
-            if direction in ("BUY", "SELL"):
-                hits += 1
-                signals.append((sym, direction, last, adx_v, ratio))
-
-            time.sleep(max(REQ_SLEEP, 0.18))
-
-        except requests.HTTPError as he:
-            # احتياط: لو ظهر -1121 هنا برضه نتجاوز الرمز ونكمل
-            if "-1121" in str(he) or "Invalid symbol" in str(he):
-                send_tg(f"⚠️ {sym}: Invalid symbol — تمت إزالته.")
-            else:
-                errors += 1
-                send_tg(f"⚠️ {sym}: HTTP {he}")
-
-        except Exception as e:
-            errors += 1
-            send_tg(f"⚠️ {sym}: Loop error: {e}")
-
-    return hits, errors, signals
-
-
-
-def detect_closes_and_notify():
-    global _prev_open
-    positions=open_positions(); now_open=set(positions.keys())
-    for s in list(state.keys()):
-        try: detect_tp_fills(s)
-        except Exception: pass
-    closed=[s for s in _prev_open if s not in now_open]
-    for s in closed:
-        st=state.pop(s, None)
-        if st:
-            try: send_close_summary_real(s, st["entry"], st["qty"], st["side"], st["open_ts_ms"], st.get("leverage",5))
-            except Exception as e: send_tg(f"🔔 تم إغلاق مركز {s} (تعذر حساب P&L: {e})")
-        else: send_tg(f"🔔 تم إغلاق مركز {s}")
-    _prev_open=now_open
-
-def send_close_summary_real(symbol, entry, qty, side, open_ts_ms, lev):
-    end_ms=int(time.time()*1000); realized, fees = income_sum(symbol, open_ts_ms-60_000, end_ms); pnl=realized+fees
-    margin=float(entry)*float(qty)/max(1,lev); roi=(pnl/margin*100) if margin>0 else 0.0; emoji="✅ ربح" if pnl>=0 else "❌ خسارة"
-    send_tg(f"📘 إغلاق مركز (فعلي)\n<b>{symbol}</b> | {emoji}\nRealized P&L: {pnl:.4f} USDT (PnL {realized:.4f}, Fees {fees:.4f})\nQty {float(qty):.8f} | Lev {lev}x | ROI≈ {roi:.2f}%")
-    mark_activity("Closed", f"{symbol} PnL={pnl:.4f}")
-
-def heartbeat(h,e,open_n, cap_used_pct):
-    send_tg(f"💗 Heartbeat | Auto-Scan Mode (Top {MAX_SYMBOLS})\nSignals: {h} | Open: {open_n} | Errors: {e}")
-
-def maybe_trade(symbol, signal, price, adx_v, strength, hedge):
-    positions=open_positions()
-    if len(positions)>=MAX_OPEN_TRADES and symbol not in positions: return
-    if symbol in positions: return
-    strong=(adx_v>=28 or strength>=0.80); lev=10 if strong else 5
-    price=get_live_price(symbol)
-    if not price or price<=0: return
-    try: ensure_margin_type(symbol, DEFAULT_MARGIN_TYPE)
-    except Exception: pass
-    ensure_leverage(symbol, lev)
-    qty=calc_order_qty(symbol, price, lev, strong)
-    if qty<=0: return
-    if strong:
-        tps=(TP1_PCT_STRONG,TP2_PCT_STRONG,TP3_PCT_STRONG)
-        try: s1,s2,s3=[float(x.strip()) for x in TP_SHARES_STRONG.split(",")]
-        except Exception: s1,s2,s3=0.35,0.35,0.30
-        shares=(s1,s2,s3); sl_pct=STOP_LOSS_PCT_STRONG; lock_pct=max(LOCK_AFTER_TP2_PCT,0.003)
-    else:
-        tps=(TP1_PCT,TP2_PCT,TP3_PCT); shares=(TP1_SHARE,TP2_SHARE,TP3_SHARE); sl_pct=STOP_LOSS_PCT_BASE; lock_pct=LOCK_AFTER_TP2_PCT
-    side="BUY" if signal=="BUY" else "SELL"; posSide=("LONG" if side=="BUY" else "SHORT") if hedge else None
-    if RUN_MODE.lower() in ("paper","analysis"):
-        f=symbol_filters(symbol)
-        state[symbol]={"side":side,"entry":price,"qty":qty,"positionSide":posSide,"open_ts_ms":int(time.time()*1000),
-                       "tp1_done":False,"tp2_done":False,"tick_size":f["tick_size"],"lot_step":f["lot_step"],
-                       "min_qty":f["min_qty"],"tps":tps,"shares":shares,"lock_pct":lock_pct,"leverage":lev}
-        sl_price=price*(1-sl_pct) if side=="BUY" else price*(1+sl_pct)
-        send_entry_alert(symbol, side, price, qty, lev, tps, sl_price); mark_activity("Entry", f"{symbol} {side} @ {fmt_price(price)}")
-        return
-    try:
-        order=place_market(symbol, side, qty, posSide); entry=float(order.get("avgPrice") or price); f=symbol_filters(symbol)
-        state[symbol]={"side":side,"entry":entry,"qty":qty,"positionSide":posSide,"open_ts_ms":int(time.time()*1000),
-                       "tp1_done":False,"tp2_done":False,"tick_size":f["tick_size"],"lot_step":f["lot_step"],
-                       "min_qty":f["min_qty"],"tps":tps,"shares":shares,"lock_pct":lock_pct,"leverage":lev}
-        place_tp3_sl(symbol, side, entry, qty, posSide, strong)
-        sl_price=entry*(1-STOP_LOSS_PCT_STRONG if strong and side=="BUY" else 1-STOP_LOSS_PCT_BASE) if side=="BUY" else entry*(1+STOP_LOSS_PCT_STRONG if strong else 1+STOP_LOSS_PCT_BASE)
-        send_entry_alert(symbol, side, entry, qty, lev, tps, sl_price); mark_activity("Entry", f"{symbol} {side} @ {fmt_price(entry)}")
-    except requests.HTTPError as he:
-        if "-1121" in str(he) or "Invalid symbol" in str(he): send_tg(f"⚠️ {symbol}: رمز غير صالح — تمت إزالته.")
-        else: send_tg(f"❌ فشل فتح {symbol}: {he}")
-    except Exception as e:
-        send_tg(f"❌ فشل فتح/تسعير {symbol}: {e}\nقد يكون المركز مفتوحًا بدون TP/SL — راجع يدويًا.")
-
-_daily_loss_triggered=False
-def check_daily_pnl_limit():
-    global _daily_loss_triggered
-    if _daily_loss_triggered: return True
-    bal=account_balance_usdt(); end_ms=int(time.time()*1000); start_of_day=datetime.now(timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0); start_ms=int(start_of_day.timestamp()*1000)
-    realized, fees=income_sum("", start_ms, end_ms); total=realized+fees
-    if total < -bal*DAILY_LOSS_LIMIT_PCT:
-        _daily_loss_triggered=True; send_tg(f"🛑 إيقاف التداول لباقي اليوم (UTC)\nخسارة اليوم: {total:.2f} USDT (> {DAILY_LOSS_LIMIT_PCT*100:.1f}%)"); return True
-    return False
-
-WATCHDOG_MIN=int(os.getenv("WATCHDOG_MIN","10")); WATCHDOG_REMINDER_MIN=int(os.getenv("WATCHDOG_REMINDER_MIN","30"))
-def watchdog_check():
-    global _watchdog_stage
-    idle_min=(now_utc()-_last_action_time).total_seconds()/60.0
-    if idle_min>=WATCHDOG_MIN and _watchdog_stage==0:
-        utc_str, ry_str=fmt_both_times(_last_activity_ts_utc); send_tg("⚠️ <b>تنبيه:</b> لا نشاط منذ "+str(WATCHDOG_MIN)+" دقيقة.\nآخر نشاط: "+_last_activity_desc+f"\n- {utc_str}\n- {ry_str}"); _watchdog_stage=1
-    elif idle_min>=WATCHDOG_MIN+WATCHDOG_REMINDER_MIN and _watchdog_stage==1:
-        utc_str, ry_str=fmt_both_times(_last_activity_ts_utc); send_tg("🚨 <b>تنبيه مستمر:</b> لا نشاط منذ "+str(int(idle_min))+" دقيقة.\nآخر نشاط: "+_last_activity_desc+f"\n- {utc_str}\n- {ry_str}"); _watchdog_stage=2
-    elif idle_min < WATCHDOG_MIN and _watchdog_stage>0:
-        send_tg("✅ عاد البوت للعمل بعد توقف مؤقت."); _watchdog_stage=0
-
-def capital_usage_pct(): n=len(_prev_open); return min(100.0, n*6.0)
-
-def main():
-    print(f"[BOOT] TG_ENABLED={TG_ENABLED} CHAT_ID={TG_CHATID}")
-    try:
-        r=session.get(f"https://api.telegram.org/bot{TG_TOKEN}/getMe", timeout=10)
-        print("[BOOT] getMe ->", r.status_code)
-    except Exception as e:
-        print("[BOOT] getMe EXC", e)
-    send_tg("♻️ اختبار اتصال تليجرام — بدء تشغيل Mahdi v5")
-    send_tg(f"🚀 تشغيل Mahdi v5 — وضع: {RUN_MODE} | Testnet: {'On' if USE_TESTNET else 'Off'}")
-    send_tg(f"🔄 Auto-Scan Mode (Top {MAX_SYMBOLS}) | فحص كل {SCAN_INTERVAL_SEC}s | أقصى صفقات {MAX_OPEN_TRADES}")
-    mark_activity("Startup", f"mode={RUN_MODE}, testnet={USE_TESTNET}")
-
-    # Debug لعرض رابط CSV
-    print("[DEBUG] SYMBOLS_CSV =", repr(SYMBOLS_CSV))
-    send_tg(f"[DEBUG] SYMBOLS_CSV={SYMBOLS_CSV}")
-
-    sync_server_time()
-hedge = is_hedge_mode()
-
-# حمّل ونسّق الرموز
-symbols = load_universe(MAX_SYMBOLS)
-symbols = [str(s).strip().upper() for s in symbols]
-
-# تأكد أنها فعلاً رموز USDT-M PERPETUAL المتاحة الآن
-valid = fetch_valid_perp_usdt()
-symbols = [s for s in symbols if s in valid]
-
-# فلترة مزدوجة بالتسعير الفعلي (لو بقي شيء غريب)
-checked = []
-for s in symbols:
-    try:
-        _ = f_get(PRICE_EP, {"symbol": s})
-        checked.append(s)
-    except Exception as e:
-        send_tg(f"⚠️ {repr(s)}: استبعدته أثناء الفحص الأولي ({e})")
-
-symbols = checked
-
-# ✅ التحقق النهائي من صلاحية الرموز في Binance
-for sym in symbols:
-    try:
-        ensure_margin_type(sym, DEFAULT_MARGIN_TYPE)
-        time.sleep(max(REQ_SLEEP, 0.03))  # مهلة قصيرة بين الطلبات
-    except Exception as e:
-        send_tg(f"⚠️ {repr(sym)}: Loop error: {e}")
-        time.sleep(0.5)  # لتجنّب ضغط رسائل التلغرام
-
-if symbols:
-    preview = ", ".join(symbols[:10])
-    if TG_NOTIFY_UNIVERSE:
-        send_tg(f"📊 Universe (بعد التحقق) النهائي: {preview}... (n={len(symbols)})")
-else:
-    send_tg("⚠️ بعد التحقق لم يتبقَّ أي زوج صالح، سأعيد المحاولة لاحقًا.")
-
-for s in symbols:
-    try:
-        ensure_margin_type(s, DEFAULT_MARGIN_TYPE)
-        time.sleep(max(REQ_SLEEP, 0.03))
+            return
+        df["symbol"] = df["symbol"].astype(str).str.upper()
+        for c in ["quoteVolume", "count", "volume", "lastPrice", "priceChangePercent"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df[df["symbol"].isin([s.upper() for s in symbols])]
+        if df.empty:
+            return
+        df = df.sort_values(["quoteVolume", "count"], ascending=[False, False])
+        lines = ["📋 Top-N Details (24h)", "┌────────────┬──────────┬───────┐", "│ Symbol     │ QuoteVol │ Trades│", "├────────────┼──────────┼───────┤"]
+        for _, r in df.iterrows():
+            sym = f"{r['symbol']:<10}"
+            qv  = _fmt_qv(r.get("quoteVolume", 0))
+            cnt = int(r.get("count", 0)) if not pd.isna(r.get("count", np.nan)) else 0
+            lines.append(f"│ {sym} │ {qv:>8} │ {cnt:>5} │")
+        lines.append("└────────────┴──────────┴───────┘")
+        send_tg("\n".join(lines))
     except Exception:
         pass
 
+# ===================== أدوات عامة =====================
+class HttpErr(requests.HTTPError):
+    pass
 
-    warmup_until=now_utc()+timedelta(minutes=1); initial_subset=symbols[:10]
-    last_hb=now_utc()-timedelta(minutes=HEARTBEAT_MIN+1); cooldown_until=now_utc()
+def now_ts_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
+def send_tg(msg: str) -> None:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        data = {"chat_id": TG_CHAT_ID, "text": msg}
+        requests.post(url, json=data, timeout=10)
+    except Exception:
+        pass
+
+def _clean_symbol(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("\u200f", "").replace("\u200e", "")
+    return s.strip().upper()
+
+def f_get(url: str, params: Optional[Dict[str, Any]] = None):
+    try:
+        r = SESSION.get(url, params=params, timeout=15)
+        if r.status_code >= 400:
+            raise HttpErr(f"GET {url} -> {r.status_code} {r.text}")
+        try:
+            return r.json()
+        except Exception:
+            return r.text
+    except requests.RequestException as e:
+        raise HttpErr(str(e))
+
+def f_signed(method: str, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not API_KEY or not API_SECRET:
+        raise HttpErr("Missing API credentials")
+    p = params.copy() if params else {}
+    p["timestamp"] = now_ts_ms()
+    query = "&".join([f"{k}={p[k]}" for k in sorted(p.keys())])
+    sig = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    p["signature"] = sig
+    headers = {"X-MBX-APIKEY": API_KEY}
+    try:
+        if method == "GET":
+            r = SESSION.get(url, params=p, headers=headers, timeout=15)
+        elif method == "POST":
+            r = SESSION.post(url, params=p, headers=headers, timeout=15)
+        else:
+            r = SESSION.delete(url, params=p, headers=headers, timeout=15)
+        if r.status_code >= 400:
+            raise HttpErr(f"{method} {url} -> {r.status_code} {r.text}")
+        return r.json()
+    except requests.RequestException as e:
+        raise HttpErr(str(e))
+
+# ===================== اختيار الأزواج Auto-TopN =====================
+
+def fetch_valid_perp_usdt() -> List[str]:
+    info = f_get(EXCHANGE_INFO)
+    out = []
+    for s in info.get("symbols", []):
+        if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+            out.append(_clean_symbol(s.get("symbol")))
+    return sorted(set(out))
+
+def build_auto_universe(top_n: Optional[int] = None) -> List[str]:
+    top_n = int(top_n or MAX_SYMBOLS)
+    tickers = f_get(TICKER_24H)
+    df = pd.DataFrame(tickers)
+    if df.empty:
+        return []
+    df["symbol"] = df["symbol"].astype(str).map(_clean_symbol)
+    df = df[df["symbol"].isin(fetch_valid_perp_usdt())]
+    for col in ["quoteVolume", "count", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # فلتر سيولة دنيا
+    if "quoteVolume" in df.columns:
+        df = df[df["quoteVolume"] >= MIN_QUOTEVOL_USDT]
+    df = df.sort_values(["quoteVolume", "count"], ascending=[False, False]).head(top_n)
+    return df["symbol"].tolist()
+
+def verify_symbol(symbol: str) -> bool:
+    s = _clean_symbol(symbol)
+    try:
+        data = f_get(EXCHANGE_INFO, {"symbol": s})
+        if not data or not data.get("symbols"):
+            return False
+        _ = f_get(PRICE_EP, {"symbol": s})
+        return True
+    except HttpErr:
+        return False
+
+# ===================== بيانات السوق والمؤشرات =====================
+
+def get_klines(symbol: str, interval: str, limit: int = 500) -> Optional[pd.DataFrame]:
+    s = _clean_symbol(symbol)
+    try:
+        raw = f_get(KLINES_EP, {"symbol": s, "interval": interval, "limit": limit})
+        cols = ["open_time","open","high","low","close","volume","close_time","qv","trades","taker_base","taker_quote","ignore"]
+        df = pd.DataFrame(raw, columns=cols)
+        for c in ["open","high","low","close","volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+        return df
+    except HttpErr:
+        return None
+
+def indicators(df: pd.DataFrame) -> Dict[str, Any]:
+    close = df["close"].astype(float)
+    high  = df["high"].astype(float)
+    low   = df["low"].astype(float)
+    vol   = df["volume"].astype(float)
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd  = ema12 - ema26
+    macds = macd.ewm(span=9, adjust=False).mean()
+    hist  = macd - macds
+
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / (loss + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
+
+    plus_dm = (high.diff()).clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    tr = (pd.concat([(high-low), (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1)).max(axis=1)
+    atr = tr.rolling(14).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/14, adjust=False).mean() / (atr + 1e-9))
+    minus_di= 100 * (minus_dm.ewm(alpha=1/14, adjust=False).mean() / (atr + 1e-9))
+    dx = 100 * ( (plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-9) )
+    adx = dx.ewm(alpha=1/14, adjust=False).mean()
+
+    ma20 = close.rolling(20).mean()
+    std20= close.rolling(20).std(ddof=0)
+    bb_up = ma20 + 2*std20
+    bb_dn = ma20 - 2*std20
+
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema200= close.ewm(span=200, adjust=False).mean()
+    vwap  = (close*vol).cumsum() / (vol.cumsum() + 1e-9)
+
+    return {
+        "close": close, "ema12": ema12, "ema26": ema26, "macd": macd, "macds": macds, "hist": hist,
+        "rsi": rsi, "adx": adx, "atr": atr, "ema50": ema50, "ema200": ema200, "bb_up": bb_up, "bb_dn": bb_dn, "vwap": vwap
+    }
+
+# فلتر الاتجاه بالفريم الأعلى
+
+def htf_trend(df_htf: pd.DataFrame) -> str:
+    if df_htf is None or df_htf.empty:
+        return "NEUTRAL"
+    ind = indicators(df_htf)
+    c = float(ind["close"].iloc[-1])
+    ema50 = float(ind["ema50"].iloc[-1])
+    ema200 = float(ind["ema200"].iloc[-1])
+    hist = float(ind["hist"].iloc[-1])
+    bull = c > ema50 and hist > 0 and (not EMA200_FILTER or c > ema200)
+    bear = c < ema50 and hist < 0 and (not EMA200_FILTER or c < ema200)
+    if bull: return "BULLISH"
+    if bear: return "BEARISH"
+    return "NEUTRAL"
+
+# تمويل
+
+def funding_abs(symbol: str) -> float:
+    try:
+        data = f_get(FUNDING_EP, {"symbol": _clean_symbol(symbol)})
+        rate = float(data.get("lastFundingRate", 0.0)) if isinstance(data, dict) else 0.0
+        return abs(rate)
+    except Exception:
+        return 0.0
+
+# ===================== أوامر وحجم صفقة =====================
+_symbol_filters_cache: Dict[str, Dict[str, float]] = {}
+
+def symbol_filters(symbol: str) -> Dict[str, float]:
+    s = _clean_symbol(symbol)
+    if s in _symbol_filters_cache:
+        return _symbol_filters_cache[s]
+    info = f_get(EXCHANGE_INFO, {"symbol": s})
+    sym = info.get("symbols", [{}])[0]
+    step = 1e-3; tick = 1e-2; min_qty = 0.0
+    for flt in sym.get("filters", []):
+        if flt.get("filterType") == "LOT_SIZE":
+            step = float(flt.get("stepSize", "0.001"))
+            min_qty = float(flt.get("minQty", "0.0"))
+        if flt.get("filterType") == "PRICE_FILTER":
+            tick = float(flt.get("tickSize", "0.01"))
+    _symbol_filters_cache[s] = {"step": step, "tick": tick, "min_qty": min_qty}
+    return _symbol_filters_cache[s]
+
+def round_step(x: float, step: float) -> float:
+    return math.floor(x / step) * step
+
+def get_balance_usdt() -> float:
+    try:
+        bals = f_signed("GET", BALANCE_EP, {})
+        for b in bals:
+            if b.get("asset") == "USDT":
+                return float(b.get("balance", 0.0))
+    except HttpErr:
+        pass
+    return 0.0
+
+def get_price(symbol: str) -> float:
+    p = f_get(PRICE_EP, {"symbol": _clean_symbol(symbol)})
+    return float(p.get("price"))
+
+def ensure_margin_type(symbol: str, mtype: str = "ISOLATED") -> bool:
+    s = _clean_symbol(symbol)
+    try:
+        f_signed("POST", MARGIN_TYPE_EP, {"symbol": s, "marginType": mtype})
+        return True
+    except HttpErr as he:
+        if "-4046" in str(he): return True
+        if "-1121" in str(he): return False
+        return False
+
+def ensure_leverage(symbol: str, lev: int) -> bool:
+    s = _clean_symbol(symbol)
+    try:
+        f_signed("POST", LEVERAGE_EP, {"symbol": s, "leverage": lev})
+        return True
+    except HttpErr:
+        return False
+
+def calc_position_size(symbol: str, entry: float, stop: float) -> float:
+    bal = get_balance_usdt()
+    risk_cap = bal * MAX_RISK_PCT
+    risk_per_unit = abs(entry - stop)
+    if risk_per_unit <= 0: return 0.0
+    qty = risk_cap / risk_per_unit
+    flt = symbol_filters(symbol)
+    qty = max(round_step(qty, flt["step"]), flt["min_qty"])
+    return max(qty, 0.0)
+
+def place_order(symbol: str, side: str, qty: float, order_type: str = "MARKET") -> Dict[str, Any]:
+    s = _clean_symbol(symbol)
+    if RUN_MODE != "real":
+        price = get_price(s)
+        return {"status": "FILLED", "symbol": s, "side": side, "origQty": qty, "price": price, "mode": "paper"}
+    return f_signed("POST", ORDER_EP, {"symbol": s, "side": side, "quantity": qty, "type": order_type})
+
+def place_conditional(symbol: str, side: str, trigger_type: str, trigger_price: float, qty: float) -> Dict[str, Any]:
+    s = _clean_symbol(symbol)
+    params = {"symbol": s, "side": side, "type": trigger_type, "stopPrice": trigger_price, "closePosition": False, "reduceOnly": True, "quantity": qty, "workingType": "MARK_PRICE"}
+    if RUN_MODE != "real":
+        return {"status": "NEW", "type": trigger_type, "stopPrice": trigger_price, "qty": qty, "mode": "paper"}
+    return f_signed("POST", ORDER_EP, params)
+
+def cancel_all(symbol: str):
+    s = _clean_symbol(symbol)
+    try:
+        if RUN_MODE == "real":
+            f_signed("DELETE", OPEN_ORDERS, {"symbol": s})
+    except HttpErr:
+        pass
+
+# ===================== إدارة الحالة والتنبيهات =====================
+open_positions: Dict[str, Dict[str, Any]] = {}
+_symbol_cooldown_until: Dict[str, float] = {}
+_reentry_lock_until: Dict[str, float] = {}
+
+
+def _interval_minutes(iv: str) -> int:
+    try:
+        return int(iv.replace('m',''))
+    except Exception:
+        return 5
+
+def fmt_votes(v: Dict[str,int]) -> str:
+    return f"B={v.get('BUY',0)} S={v.get('SELL',0)} H={v.get('HOLD',0)}"
+
+def compute_sl_tp(entry: float, atr: float, side: str) -> Tuple[float, float, float, float]:
+    if side == "BUY":
+        sl = entry - STOP_ATR_MULT * atr
+        tp1 = entry + TP1_R_MULT * (entry - sl)
+        tp2 = entry + TP2_R_MULT * (entry - sl)
+        tp3 = entry + TP3_R_MULT * (entry - sl)
+    else:
+        sl = entry + STOP_ATR_MULT * atr
+        tp1 = entry - TP1_R_MULT * (sl - entry)
+        tp2 = entry - TP2_R_MULT * (sl - entry)
+        tp3 = entry - TP3_R_MULT * (sl - entry)
+    return sl, tp1, tp2, tp3
+
+def manage_trailing(symbol: str, side: str, entry: float, atr: float, qty_left: float):
+    price = get_price(symbol)
+    sl = open_positions[symbol]["sl"]
+    # عدّل قوة التريلينغ إذا تجاوز TP2
+    trail_mult = open_positions[symbol].get("trail_mult", TRAIL_ATR_MULT)
+    if side == "BUY":
+        new_sl = max(sl, price - trail_mult * atr)
+        if new_sl > sl:
+            open_positions[symbol]["sl"] = new_sl
+            place_conditional(symbol, "SELL", "STOP_MARKET", new_sl, qty_left)
+            send_tg(f"🔁 Trailing SL {symbol} -> {new_sl:.4f} | rem={qty_left}")
+    else:
+        new_sl = min(sl, price + trail_mult * atr)
+        if new_sl < sl:
+            open_positions[symbol]["sl"] = new_sl
+            place_conditional(symbol, "BUY", "STOP_MARKET", new_sl, qty_left)
+            send_tg(f"🔁 Trailing SL {symbol} -> {new_sl:.4f} | rem={qty_left}")
+
+def maybe_notify_tp_sl(symbol: str, price: float):
+    st = open_positions.get(symbol)
+    if not st: return
+    side, entry, sl, atr = st["side"], st["entry"], st["sl"], st["atr"]
+    tps = st["tps"]
+    qty0 = st["qty"]
+    remaining = st["qty_left"]
+
+    def on_hit(label: str, trigger: float, pct_close: float):
+        nonlocal remaining
+        if remaining <= 0: return
+        part = round_step(qty0 * pct_close, symbol_filters(symbol)["step"]) if label != "SL" else remaining
+        remaining = max(0.0, remaining - part)
+        open_positions[symbol]["qty_left"] = remaining
+        pnl = (trigger - entry) * part if side == "BUY" else (entry - trigger) * part
+        r_mult = abs(trigger - entry) / max(1e-9, abs(entry - sl))
+        if label.startswith("TP"): METRICS["tp_hits"] += 1
+        if label == "SL":
+            METRICS["sl_hits"] += 1
+            _symbol_cooldown_until[symbol] = time.time() + SYMBOL_COOLDOWN_MIN*60
+        METRICS["realized_pnl"] += pnl
+        send_tg(
+            f"🎯 {label} {symbol} @ {trigger:.4f} | part={part} | rem={remaining} | ~PnL={pnl:.4f} | ~{r_mult:.2f}R"
+        )
+        # Breakeven بعد TP1
+        if BREAKEVEN_AFTER_TP1 and label == "TP1":
+            be = entry + (BE_OFFSET_MULT * atr if side=="BUY" else -BE_OFFSET_MULT * atr)
+            open_positions[symbol]["sl"] = be
+            place_conditional(symbol, ("SELL" if side=="BUY" else "BUY"), "STOP_MARKET", be, remaining)
+            send_tg(f"🛡️ BE {symbol}: SL -> {be:.4f} بعد TP1")
+        # Trailing أقوى بعد TP2
+        if label == "TP2":
+            open_positions[symbol]["trail_mult"] = POST_TP2_TRAIL_MULT
+            send_tg(f"⚙️ Trail Mult {symbol} -> {POST_TP2_TRAIL_MULT}")
+        if remaining <= 0:
+            send_tg(f"📘 EXIT {symbol} | entry={entry:.4f} | SL={sl:.4f} | realized≈{METRICS['realized_pnl']:.4f}")
+            cancel_all(symbol)
+            open_positions.pop(symbol, None)
+            # غلق إعادة الدخول لبضع شموع
+            mins = _interval_minutes(INTERVAL) * REENTRY_LOCK_BARS
+            _reentry_lock_until[symbol] = time.time() + mins*60
+
+    if side == "BUY":
+        if price <= sl: on_hit("SL", sl, 1.0)
+        else:
+            if (not tps[0][2]) and price >= tps[0][0]: tps[0][2] = True; on_hit("TP1", tps[0][0], tps[0][1])
+            if (not tps[1][2]) and price >= tps[1][0]: tps[1][2] = True; on_hit("TP2", tps[1][0], tps[1][1])
+            if (not tps[2][2]) and price >= tps[2][0]: tps[2][2] = True; on_hit("TP3", tps[2][0], tps[2][1])
+    else:
+        if price >= sl: on_hit("SL", sl, 1.0)
+        else:
+            if (not tps[0][2]) and price <= tps[0][0]: tps[0][2] = True; on_hit("TP1", tps[0][0], tps[0][1])
+            if (not tps[1][2]) and price <= tps[1][0]: tps[1][2] = True; on_hit("TP2", tps[1][0], tps[1][1])
+            if (not tps[2][2]) and price <= tps[2][0]: tps[2][2] = True; on_hit("TP3", tps[2][0], tps[2][1])
+
+# ===================== إجماع الإشارة =====================
+
+def consensus_signal(df: pd.DataFrame) -> Tuple[str, Dict[str,int]]:
+    if df is None or df.empty:
+        return "HOLD", {"BUY":0, "SELL":0, "HOLD":1}
+    ind = indicators(df)
+    c = ind["close"].iloc[-1]
+    prev_hist = ind["hist"].iloc[-2]; curr_hist = ind["hist"].iloc[-1]
+
+    votes = []
+    bullish = c > ind["ema50"].iloc[-1]
+    if curr_hist > 0 and prev_hist <= 0 and bullish: votes.append("BUY")
+    elif curr_hist < 0 and prev_hist >= 0 and (not bullish): votes.append("SELL")
+    else: votes.append("HOLD")
+
+    r = float(ind["rsi"].iloc[-1])
+    if r < RSI_SELL_MIN: votes.append("BUY")
+    elif r > RSI_BUY_MAX: votes.append("SELL")
+    else: votes.append("HOLD")
+
+    if float(ind["adx"].iloc[-1]) >= ADX_MIN: votes.append("TREND_OK")
+    else: votes.append("TREND_WEAK")
+
+    if c <= float(ind["bb_dn"].iloc[-1]): votes.append("BUY")
+    elif c >= float(ind["bb_up"].iloc[-1]): votes.append("SELL")
+    else: votes.append("HOLD")
+
+    if c > float(ind["vwap"].iloc[-1]) and bullish: votes.append("BUY")
+    elif c < float(ind["vwap"].iloc[-1]) and (not bullish): votes.append("SELL")
+    else: votes.append("HOLD")
+
+    atr_pct = float(ind["atr"].iloc[-1]) / (c + 1e-9) * 100.0
+    if atr_pct < MIN_ATR_PCT:
+        return "HOLD", {"BUY":0, "SELL":0, "HOLD":1}
+
+    buy_votes  = sum(1 for v in votes if v == "BUY")
+    sell_votes = sum(1 for v in votes if v == "SELL")
+    total_votes= buy_votes + sell_votes
+    if total_votes == 0:
+        return "HOLD", {"BUY":0, "SELL":0, "HOLD":1}
+
+    if buy_votes / 5.0 >= CONSENSUS_MIN and "TREND_OK" in votes:
+        METRICS["signals"] += 1
+        return "BUY", {"BUY":buy_votes, "SELL":sell_votes, "HOLD":5 - total_votes}
+    if sell_votes / 5.0 >= CONSENSUS_MIN and "TREND_OK" in votes:
+        METRICS["signals"] += 1
+        return "SELL", {"BUY":buy_votes, "SELL":sell_votes, "HOLD":5 - total_votes}
+    return "HOLD", {"BUY":buy_votes, "SELL":sell_votes, "HOLD":5 - total_votes}
+
+# ======= مسار الدخول مع كل الفلاتر =======
+
+def try_enter(symbol: str):
+    # توقف يومي
+    if _session_day != date.today():
+        # يوم جديد: إعادة ضبط
+        _session_day = date.today()
+        METRICS.update({"signals":0, "trades":0, "tp_hits":0, "sl_hits":0, "realized_pnl":0.0})
+        global _session_start_balance
+        _session_start_balance = None
+    if DAILY_LOSS_STOP_USDT > -1e6 and METRICS['realized_pnl'] <= DAILY_LOSS_STOP_USDT:
+        return
+    if _session_start_balance is None:
+        _session_start_balance = get_balance_usdt()
+    if DAILY_LOSS_STOP_PCT > -100:
+        if _session_start_balance > 0 and (METRICS['realized_pnl']/_session_start_balance*100) <= DAILY_LOSS_STOP_PCT:
+            return
+
+    # تبريد أو منع إعادة الدخول
+    nowt = time.time()
+    if _symbol_cooldown_until.get(symbol, 0) > nowt: return
+    if _reentry_lock_until.get(symbol, 0) > nowt: return
+
+    # حد الصفقات المتزامنة
+    if len(open_positions) >= MAX_CONCURRENT_TRADES:
+        return
+
+    # فلتر تمويل
+    if funding_abs(symbol) > FUNDING_ABS_MAX:
+        return
+
+    df = get_klines(symbol, INTERVAL, 300)
+    if df is None or df.empty: return
+
+    sig, votes = consensus_signal(df)
+    if sig == "HOLD": return
+
+    # فلتر الفريم الأعلى
+    df_htf = get_klines(symbol, HTF_INTERVAL, 300)
+    trend = htf_trend(df_htf)
+    if (sig == "BUY" and trend != "BULLISH") or (sig == "SELL" and trend != "BEARISH"):
+        return
+
+    ind = indicators(df)
+    price = float(ind["close"].iloc[-1])
+    atr   = float(ind["atr"].iloc[-1])
+    side  = "BUY" if sig == "BUY" else "SELL"
+
+    sl, tp1, tp2, tp3 = compute_sl_tp(price, atr, side)
+    qty = calc_position_size(symbol, price, sl)
+    if qty <= 0: return
+
+    ensure_margin_type(symbol, DEFAULT_MARGIN_TYPE)
+    ensure_leverage(symbol, LEVERAGE)
+
+    res = place_order(symbol, side, qty, "MARKET")
+    METRICS["trades"] += 1
+    cancel_all(symbol)
+
+    if side == "BUY":
+        place_conditional(symbol, "SELL", "STOP_MARKET", sl, qty)
+        tp1q = round_step(qty*TP1_PCT_CLOSE, symbol_filters(symbol)["step"]) ; place_conditional(symbol, "SELL", "TAKE_PROFIT_MARKET", tp1, tp1q)
+        tp2q = round_step(qty*TP2_PCT_CLOSE, symbol_filters(symbol)["step"]) ; place_conditional(symbol, "SELL", "TAKE_PROFIT_MARKET", tp2, tp2q)
+        tp3q = round_step(qty*TP3_PCT_CLOSE, symbol_filters(symbol)["step"]) ; place_conditional(symbol, "SELL", "TAKE_PROFIT_MARKET", tp3, tp3q)
+    else:
+        place_conditional(symbol, "BUY", "STOP_MARKET", sl, qty)
+        tp1q = round_step(qty*TP1_PCT_CLOSE, symbol_filters(symbol)["step"]) ; place_conditional(symbol, "BUY", "TAKE_PROFIT_MARKET", tp1, tp1q)
+        tp2q = round_step(qty*TP2_PCT_CLOSE, symbol_filters(symbol)["step"]) ; place_conditional(symbol, "BUY", "TAKE_PROFIT_MARKET", tp2, tp2q)
+        tp3q = round_step(qty*TP3_PCT_CLOSE, symbol_filters(symbol)["step"]) ; place_conditional(symbol, "BUY", "TAKE_PROFIT_MARKET", tp3, tp3q)
+
+    open_positions[symbol] = {
+        "side": side, "entry": price, "sl": sl, "atr": atr, "qty": qty,
+        "qty_left": qty, "tps": [[tp1, TP1_PCT_CLOSE, False], [tp2, TP2_PCT_CLOSE, False], [tp3, TP3_PCT_CLOSE, False]],
+        "realized": 0.0, "trail_mult": TRAIL_ATR_MULT
+    }
+
+    r_unit = abs(price - sl)
+    send_tg(
+        f"✅ ENTRY {symbol} {side} qty={qty} @~{price:.4f}\n"
+        f"SL {sl:.4f} | R={r_unit:.4f} | TP1 {tp1:.4f}({TP1_PCT_CLOSE*100:.0f}%) TP2 {tp2:.4f}({TP2_PCT_CLOSE*100:.0f}%) TP3 {tp3:.4f}({TP3_PCT_CLOSE*100:.0f}%)\n"
+        f"profile={RISK_PROFILE} | HTF={trend} | lev={LEVERAGE}x | margin={DEFAULT_MARGIN_TYPE}"
+    )
+
+# ============== ملخص كل ساعة (جدول نصّي بسيط) ==============
+
+def hourly_summary():
+    lines = [
+        "🕐 Hourly Summary (Session)",
+        "┌──────────────┬────────┐",
+        f"│ Signals      │ {METRICS['signals']:>6} │",
+        f"│ Trades       │ {METRICS['trades']:>6} │",
+        f"│ TP hits      │ {METRICS['tp_hits']:>6} │",
+        f"│ SL hits      │ {METRICS['sl_hits']:>6} │",
+        f"│ Realized PnL │ {METRICS['realized_pnl']:>6.4f} │",
+        "└──────────────┴────────┘",
+        f"mode={RUN_MODE} | lev={LEVERAGE}x | margin={DEFAULT_MARGIN_TYPE} | profile={RISK_PROFILE} | TF={INTERVAL}->{HTF_INTERVAL}"
+    ]
+    send_tg("\n".join(lines))
+
+# ===================== التحميل والحلقة =====================
+
+def load_universe(top_n: Optional[int] = None) -> List[str]:
+    top_n = int(top_n or MAX_SYMBOLS)
+    final: List[str] = []
+
+    if SYMBOLS_CSV:
+        try:
+            try:
+                df = pd.read_csv(SYMBOLS_CSV)
+            except Exception:
+                df = pd.read_csv(SYMBOLS_CSV, header=None, names=["symbol"])
+            syms = [_clean_symbol(s) for s in df["symbol"] if str(s).strip()]
+            valid = set(fetch_valid_perp_usdt())
+            for s in syms:
+                if s not in valid: continue
+                if verify_symbol(s): final.append(s)
+                if len(final) >= top_n: break
+        except Exception:
+            final = []
+
+    if not final:
+        final = build_auto_universe(top_n)
+
+    checked = []
+    for s in final:
+        if verify_symbol(s): checked.append(s)
+    return checked[:top_n]
+
+
+def main_loop():
+    global _last_summary_ts, _session_start_balance, _session_day
+    send_tg("🚀 MahdiBot v5 PRO — ALL Add-ons Enabled")
+    symbols = load_universe(MAX_SYMBOLS)
+    if not symbols:
+        send_tg("❌ لم يتم العثور على أزواج صالحة — توقف")
+        print("No valid symbols.")
+        return
+    print("Universe:", symbols)
+    send_tg(
+        f"📊 Universe (n={len(symbols)}): {', '.join(symbols[:12])}{'…' if len(symbols)>12 else ''}\n"
+        f"mode={RUN_MODE} | lev={LEVERAGE}x | margin={DEFAULT_MARGIN_TYPE} | profile={RISK_PROFILE} | TF={INTERVAL}->{HTF_INTERVAL}"
+    )
+    send_universe_details(symbols)
+
+    _last_summary_ts = time.time()
+    _session_day = date.today()
+    _session_start_balance = get_balance_usdt()
+
+    SLEEP_SEC = int(os.getenv("SLEEP_SEC", "30"))
     while True:
         try:
-            if check_daily_pnl_limit(): time.sleep(60); watchdog_check(); continue
-            if now_utc()<cooldown_until: trailing_manager(); time.sleep(1); watchdog_check(); continue
-            subset=initial_subset if now_utc()<warmup_until else symbols
-            h,e,sigs=scan_once(subset)
-            for sym,sig,px,adx_v,ratio in sigs:
-                if adx_v<ADX_MIN or ratio<CONSENSUS_RATIO:
-                    if TG_NOTIFY_WEAK: send_tg(f"⚠️ تجاهل {sym}: إشارة ضعيفة (ADX {adx_v:.1f}, Ratio {ratio:.2f})")
-                    continue
-                maybe_trade(sym,sig,px,adx_v,ratio,hedge)
-            detect_closes_and_notify(); trailing_manager()
-            if (now_utc()-last_hb)>=timedelta(minutes=HEARTBEAT_MIN): heartbeat(h,e,len(_prev_open), capital_usage_pct()); last_hb=now_utc()
-            cooldown_until=now_utc()+timedelta(seconds=SCAN_INTERVAL_SEC if h==0 else COOLDOWN_MIN*60); watchdog_check(); time.sleep(1)
-        except Exception as ex:
-            send_tg(f"⚠️ Loop error: {ex}"); time.sleep(3); watchdog_check()
+            for sym in symbols:
+                sym = _clean_symbol(sym)
+                try:
+                    if sym not in open_positions:
+                        try_enter(sym)
+                    else:
+                        pos = open_positions[sym]
+                        price = get_price(sym)
+                        manage_trailing(sym, pos["side"], pos["entry"], pos["atr"], pos["qty_left"])
+                        maybe_notify_tp_sl(sym, price)
+                except HttpErr as he:
+                    if "-1121" in str(he):
+                        send_tg(f"⚠️ {sym}: Invalid symbol — شُطب.")
+                    else:
+                        send_tg(f"⚠️ {sym}: Error {he}")
+                time.sleep(0.2)
 
-if __name__=="__main__":
-    main()
+            now_ts = time.time()
+            if now_ts - _last_summary_ts >= SUMMARY_EVERY_SEC:
+                hourly_summary()
+                _last_summary_ts = now_ts
+
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            send_tg(f"⚠️ Loop error: {e}")
+        time.sleep(SLEEP_SEC)
+
+if __name__ == "__main__":
+    print("MahdiBot v5 PRO — ALL Add-ons Enabled")
+    main_loop()
