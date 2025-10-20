@@ -784,8 +784,7 @@ def main_loop():
             # Heartbeat كل 4 ساعات (قابلة للتعديل)
             if now_ts - _last_heartbeat_ts >= HEARTBEAT_EVERY_SEC:
                 up_hours = (now_ts - (_session_start_balance and _last_heartbeat_ts or now_ts)) / 3600.0
-                send_tg("✅ الخادم يعمل — Heartbeat
-⏱️ interval=4h | bot=online")
+                send_tg("✅ الخادم يعمل — Heartbeat\n⏱️ interval=4h | bot=online")
                 _last_heartbeat_ts = now_ts
 
         except KeyboardInterrupt:
