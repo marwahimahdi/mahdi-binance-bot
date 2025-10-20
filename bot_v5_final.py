@@ -24,7 +24,23 @@ from dotenv import load_dotenv
 
 # ===================== تحميل البيئة =====================
 load_dotenv()
+# ====== نظام تنظيم الطلبات ومنع الحظر ======
+import time, requests
+from time import monotonic, sleep
 
+REST_COOLDOWN_SEC = float(os.getenv("REST_COOLDOWN_SEC", "5"))
+BAN_SLEEP_SEC = int(os.getenv("BAN_SLEEP_SEC", "180"))
+
+_last_rest_call = 0.0
+def _throttle():
+    """يضمن وجود فجوة زمنية دنيا بين أي طلبين REST"""
+    global _last_rest_call
+    now = monotonic()
+    gap = now - _last_rest_call
+    if gap < REST_COOLDOWN_SEC:
+        sleep(REST_COOLDOWN_SEC - gap)
+    _last_rest_call = now
+# ============================================
 API_KEY  = os.getenv("API_KEY", "")
 API_SECRET = os.getenv("API_SECRET", "")
 TG_TOKEN = os.getenv("TG_TOKEN", "")
