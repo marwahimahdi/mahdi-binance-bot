@@ -378,27 +378,42 @@ def build_auto_universe():
         except Exception: continue
     return final
 
-def load_universe(top_n=None):
-    # احترم MAX_SYMBOLS إن لم يُمرر top_n
-    top_n = int(top_n or os.getenv("MAX_SYMBOLS", "10"))
+def load_universe(top_n: int | None = None) -> list:
+    """
+    يبني قائمة الأزواج (USDT-PERP فقط) من ملف CSV إن وُجد، وإلا يعتمد Auto-TopN.
+    يحترم MAX_SYMBOLS من البيئة عندما لا يُمرَّر top_n.
+    """
+    # احترم MAX_SYMBOLS إذا لم يُمرَّر top_n
+    try:
+        max_symbols = int(os.getenv("MAX_SYMBOLS", "10"))
+    except Exception:
+        max_symbols = 10
 
-    # 1) اجلب قائمة الرموز المسموحة: USDT-PERPETUAL فقط (FUTURES)
+    if top_n is None or int(top_n) <= 0:
+        top_n = max_symbols
+    else:
+        top_n = int(top_n)
+
+    # 1) الرموز المسموحة: USDT-PERP (FUTURES)
     valid = fetch_valid_perp_usdt()
+    out: list[str] = []
 
-    # 2) حاول قراءة CSV إذا SYMBOLS_CSV موجود
+    # 2) إن كان هناك CSV مفعَّل، حاوِل استخدامه أولاً
     if SYMBOLS_CSV:
         try:
             try:
-                df = pd.read_csv(SYMBOLS_CSV)              # مع عنوان عمود "symbol"
+                df = pd.read_csv(SYMBOLS_CSV)  # قد يحتوي عمود "symbol"
+                col = "symbol" if "symbol" in df.columns else df.columns[0]
+                syms = [str(s).strip().upper() for s in df[col] if str(s).strip()]
             except Exception:
-                df = pd.read_csv(SYMBOLS_CSV, header=None, names=["symbol"])  # بدون عنوان
-            syms = [str(s).strip().upper() for s in df["symbol"] if str(s).strip()]
-            syms = [s for s in syms if s in valid]
+                df = pd.read_csv(SYMBOLS_CSV, header=None, names=["symbol"])  # بدون عناوين
+                syms = [str(s).strip().upper() for s in df["symbol"] if str(s).strip()]
 
-            out = []
+            syms = [s for s in syms if s in valid]  # فلترة حسب الـ FUTURES المسموحة
+
             for s in syms:
                 try:
-                    _ = f_get(PRICE_EP, {"symbol": s})     # تأكيد أنه قابل للتسعير
+                    _ = f_get(PRICE_EP, {"symbol": s})  # تأكيد أنه قابل للتسعير
                     out.append(s)
                     if len(out) >= top_n:
                         break
@@ -406,37 +421,47 @@ def load_universe(top_n=None):
                     continue
 
             if out:
-                send_tg(f"📊 Universe من CSV: {', '.join(out)} (n={len(out)})")
+                send_tg(f"📊 Universe من CSV: {', '.join(out[:10])}... (n={len(out)})")
+                # DEBUG
+                send_tg(
+                    f"[DEBUG] valid_count={len(valid)} | BTCUSDT in valid? { 'BTCUSDT' in valid } | "
+                    f"ETHUSDT in valid? { 'ETHUSDT' in valid }"
+                )
                 return out
         except Exception as e:
             send_tg(f"⚠️ تعذر قراءة CSV: {e}")
 
-    # 3) السقوط إلى Auto-TopN (FUTURES فقط)
-    tickers = f_get(TICKER_24H, {"type": "FULL"})
-    df = pd.DataFrame(tickers)
-    df = df[df["symbol"].isin(valid)].copy()
-    if df.empty:
-        send_tg("⚠️ لا مرشحين بعد الفلترة — سأعيد المحاولة.")
+    # 3) السقوط إلى Auto-TopN (حسب أعلى quoteVolume)
+    try:
+        tickers = f_get(TICKER_24H, {"type": "FULL"})
+        df = pd.DataFrame(tickers)
+        df = df[df["symbol"].isin(valid)].copy()
+        if df.empty:
+            send_tg("⚠️ لا مرشحين بعد الفلترة — سأعيد المحاولة.")
+            return []
+
+        df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce").fillna(0.0)
+        candidates = df.sort_values("quoteVolume", ascending=False)["symbol"].tolist()
+
+        for s in candidates:
+            try:
+                _ = f_get(PRICE_EP, {"symbol": s})
+                out.append(s)
+                if len(out) >= top_n:
+                    break
+            except Exception:
+                continue
+
+        send_tg(f"📊 Universe (Auto-Top{top_n}): {', '.join(out[:10])}... (n={len(out)})")
+        # DEBUG
+        send_tg(
+            f"[DEBUG] valid_count={len(valid)} | BTCUSDT in valid? { 'BTCUSDT' in valid } | "
+            f"ETHUSDT in valid? { 'ETHUSDT' in valid }"
+        )
+        return out
+    except Exception as e:
+        send_tg(f"⚠️ فشل بناء Universe تلقائيًا: {e}")
         return []
-    df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce").fillna(0.0)
-
-    candidates = df.sort_values("quoteVolume", ascending=False)["symbol"].tolist()
-    out = []
-    for s in candidates:
-        try:
-            _ = f_get(PRICE_EP, {"symbol": s})
-            out.append(s)
-            if len(out) >= top_n:
-                break
-        except Exception:
-            continue
-
-    send_tg(f"📊 Universe (Auto-Top{top_n}): {', '.join(out[:10])}... (n={len(out)})")
-    # ========== DEBUG VALID PAIRS ==========
-valid = fetch_valid_perp_usdt()
-send_tg(f"[DEBUG] valid_count={len(valid)} | BTCUSDT in valid? { 'BTCUSDT' in valid } | ETHUSDT in valid? { 'ETHUSDT' in valid }")
-# ======================================
-return out
 
 def place_market(symbol, side, qty, positionSide=None):
     f=symbol_filters(symbol); qty_str=qty_to_step(qty, f["lot_step"], f["min_qty"])
