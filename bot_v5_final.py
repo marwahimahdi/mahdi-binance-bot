@@ -143,15 +143,22 @@ def now_ts_ms() -> int:
 
 def send_tg(msg: str) -> None:
     if not TG_TOKEN or not TG_CHAT_ID:
+        print("[TG] Missing TG_TOKEN or TG_CHAT_ID — skipping send.")
         return
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         data = {"chat_id": TG_CHAT_ID, "text": msg}
-        requests.post(url, json=data, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(url, json=data, timeout=10)
+        if r.status_code != 200:
+            try:
+                body = r.text
+            except Exception:
+                body = "<no body>"
+            print(f"[TG] sendMessage failed {r.status_code}: {body}")
+    except Exception as e:
+        print(f"[TG] Exception sending: {e}")
 
-def _clean_symbol(s: str) -> str:
+def _clean_symbol(s: str) -> str:(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
@@ -552,12 +559,12 @@ def consensus_signal(df: pd.DataFrame) -> Tuple[str, Dict[str,int]]:
 # ======= مسار الدخول مع كل الفلاتر =======
 
 def try_enter(symbol: str):
+    global _session_day, _session_start_balance
     # توقف يومي
+    # إعادة ضبط عدادات اليوم عند تبدّل التاريخ
     if _session_day != date.today():
-        # يوم جديد: إعادة ضبط
         _session_day = date.today()
         METRICS.update({"signals":0, "trades":0, "tp_hits":0, "sl_hits":0, "realized_pnl":0.0})
-        global _session_start_balance
         _session_start_balance = None
     if DAILY_LOSS_STOP_USDT > -1e6 and METRICS['realized_pnl'] <= DAILY_LOSS_STOP_USDT:
         return
