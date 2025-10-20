@@ -193,6 +193,7 @@ def _clean_symbol(s: str) -> str:
 
 def f_get(url: str, params: Optional[Dict[str, Any]] = None):
     try:
+        _throttle()
         r = SESSION.get(url, params=params, timeout=15)
         if r.status_code >= 400:
             raise HttpErr(f"GET {url} -> {r.status_code} {r.text}")
