@@ -72,6 +72,14 @@ FUNDING_ABS_MAX     = float(os.getenv("FUNDING_ABS_MAX", "0.0005"))  # 0.05%
 DAILY_LOSS_STOP_USDT= float(os.getenv("DAILY_LOSS_STOP_USDT", "-999999"))  # عطّل إذا كبير جدًا
 DAILY_LOSS_STOP_PCT = float(os.getenv("DAILY_LOSS_STOP_PCT", "-100.0"))   # عطّل إذا -100%
 
+# رافعة ديناميكية حسب قوة الإشارة
+AUTO_LEVERAGE_SIGNAL = os.getenv("AUTO_LEVERAGE_SIGNAL", "false").lower() == "true"
+IM_PCT_BASE = float(os.getenv("IM_PCT_BASE", "0.05"))          # 5% هامش للصفقات العادية
+IM_PCT_STRONG = float(os.getenv("IM_PCT_STRONG", "0.10"))       # 10% للصفقات القوية
+STRONG_SIGNAL_THRESHOLD = float(os.getenv("STRONG_SIGNAL_THRESHOLD", "0.80"))
+LEV_MIN_ENV = int(os.getenv("LEV_MIN", "3"))
+LEV_MAX_ENV = int(os.getenv("LEV_MAX", "15"))
+
 SYMBOLS_CSV = os.getenv("SYMBOLS_CSV", "").strip()
 
 # ===================== مسارات Binance =====================
@@ -92,7 +100,9 @@ SESSION.headers.update({"Content-Type": "application/json"})
 # ===================== عدّادات الجلسة =====================
 METRICS = {"signals": 0, "trades": 0, "tp_hits": 0, "sl_hits": 0, "realized_pnl": 0.0}
 _last_summary_ts = 0.0
+_last_heartbeat_ts = 0.0
 SUMMARY_EVERY_SEC = int(os.getenv("SUMMARY_EVERY_SEC", str(60*60)))
+HEARTBEAT_EVERY_SEC = int(os.getenv("HEARTBEAT_EVERY_SEC", str(4*60*60)))  # كل 4 ساعات افتراضيًا
 _session_day = date.today()
 _session_start_balance = None
 
@@ -158,7 +168,7 @@ def send_tg(msg: str) -> None:
     except Exception as e:
         print(f"[TG] Exception sending: {e}")
 
-def _clean_symbol(s: str) -> str:
+def _clean_symbol(s: str) -> str:(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
@@ -556,6 +566,33 @@ def consensus_signal(df: pd.DataFrame) -> Tuple[str, Dict[str,int]]:
         return "SELL", {"BUY":buy_votes, "SELL":sell_votes, "HOLD":5 - total_votes}
     return "HOLD", {"BUY":buy_votes, "SELL":sell_votes, "HOLD":5 - total_votes}
 
+# ========= دوال حساب قوة الإشارة والرافعة المستهدفة =========
+
+def signal_confidence(votes: dict, htf_trend_label: str, adx_value: float, ema200_ok: bool, macd_hist_slope: float) -> float:
+    """ درجة ثقة 0..1 مبنية على مخرجات البوت نفسه """
+    # إجماع المؤشرات (من 5 مؤشرات)
+    consensus = max(votes.get("BUY",0), votes.get("SELL",0)) / 5.0
+    # قوة الاتجاه
+    adx_score = min(1.0, adx_value / 25.0)  # ADX≈25 يعتبر قوي كفاية
+    # فلتر الفريم الأعلى
+    trend_score = 1.0 if htf_trend_label in ("BULLISH","BEARISH") else 0.0
+    # توافق EMA200
+    ema200_score = 1.0 if ema200_ok else 0.0
+    # ميل هيستوجرام MACD (آخر-سابق)
+    slope_score = 1.0 if macd_hist_slope > 0 else 0.0
+    # أوزان محافظة
+    w_cons, w_adx, w_trend, w_ema200, w_slope = 0.40, 0.20, 0.20, 0.15, 0.05
+    score = (consensus*w_cons + adx_score*w_adx + trend_score*w_trend + ema200_score*w_ema200 + slope_score*w_slope)
+    return max(0.0, min(1.0, score))
+
+
+def choose_leverage_for_target_im(balance_usdt: float, entry: float, qty: float, target_im_pct: float) -> int:
+    """ يحسب الرافعة اللازمة ليكون الهامش الأولي ≈ target_im_pct من الرصيد """
+    notional = max(1e-6, entry * qty)
+    desired_im = max(1e-6, balance_usdt * target_im_pct)
+    lev = int(math.ceil(notional / desired_im))
+    return max(LEV_MIN_ENV, min(lev, LEV_MAX_ENV))
+
 # ======= مسار الدخول مع كل الفلاتر =======
 
 def try_enter(symbol: str):
@@ -604,12 +641,25 @@ def try_enter(symbol: str):
     atr   = float(ind["atr"].iloc[-1])
     side  = "BUY" if sig == "BUY" else "SELL"
 
+    # حساب درجة الثقة بناءً على الإشارة والفريم الأعلى
+    adx_value = float(ind["adx"].iloc[-1])
+    ema200_ok = (price > float(ind["ema200"].iloc[-1])) if side=="BUY" else (price < float(ind["ema200"].iloc[-1]))
+    macd_hist_slope = float(ind["hist"].iloc[-1] - ind["hist"].iloc[-2])
+    conf = signal_confidence(votes, trend, adx_value, ema200_ok, macd_hist_slope)
+
     sl, tp1, tp2, tp3 = compute_sl_tp(price, atr, side)
     qty = calc_position_size(symbol, price, sl)
     if qty <= 0: return
 
     ensure_margin_type(symbol, DEFAULT_MARGIN_TYPE)
-    ensure_leverage(symbol, LEVERAGE)
+    # اختيار رافعة ديناميكية حسب قوة الإشارة لاستهداف هامش 5% أو 10%
+    lev_to_use = LEVERAGE
+    if AUTO_LEVERAGE_SIGNAL:
+        target_im = IM_PCT_BASE
+        if conf >= STRONG_SIGNAL_THRESHOLD:
+            target_im = IM_PCT_STRONG
+        lev_to_use = choose_leverage_for_target_im(get_balance_usdt(), price, qty, target_im)
+    ensure_leverage(symbol, lev_to_use)
 
     res = place_order(symbol, side, qty, "MARKET")
     METRICS["trades"] += 1
@@ -633,10 +683,11 @@ def try_enter(symbol: str):
     }
 
     r_unit = abs(price - sl)
+    strong_tag = " 🔥" if (AUTO_LEVERAGE_SIGNAL and conf >= STRONG_SIGNAL_THRESHOLD) else ""
     send_tg(
-        f"✅ ENTRY {symbol} {side} qty={qty} @~{price:.4f}\n"
+        f"✅ ENTRY{strong_tag} {symbol} {side} qty={qty} @~{price:.4f}\n"
         f"SL {sl:.4f} | R={r_unit:.4f} | TP1 {tp1:.4f}({TP1_PCT_CLOSE*100:.0f}%) TP2 {tp2:.4f}({TP2_PCT_CLOSE*100:.0f}%) TP3 {tp3:.4f}({TP3_PCT_CLOSE*100:.0f}%)\n"
-        f"profile={RISK_PROFILE} | HTF={trend} | lev={LEVERAGE}x | margin={DEFAULT_MARGIN_TYPE}"
+        f"profile={RISK_PROFILE} | HTF={trend} | lev={lev_to_use}x | conf={conf:.2f} | margin={DEFAULT_MARGIN_TYPE}"
     )
 
 # ============== ملخص كل ساعة (جدول نصّي بسيط) ==============
@@ -701,6 +752,7 @@ def main_loop():
     send_universe_details(symbols)
 
     _last_summary_ts = time.time()
+    _last_heartbeat_ts = time.time()
     _session_day = date.today()
     _session_start_balance = get_balance_usdt()
 
@@ -728,6 +780,13 @@ def main_loop():
             if now_ts - _last_summary_ts >= SUMMARY_EVERY_SEC:
                 hourly_summary()
                 _last_summary_ts = now_ts
+
+            # Heartbeat كل 4 ساعات (قابلة للتعديل)
+            if now_ts - _last_heartbeat_ts >= HEARTBEAT_EVERY_SEC:
+                up_hours = (now_ts - (_session_start_balance and _last_heartbeat_ts or now_ts)) / 3600.0
+                send_tg("✅ الخادم يعمل — Heartbeat
+⏱️ interval=4h | bot=online")
+                _last_heartbeat_ts = now_ts
 
         except KeyboardInterrupt:
             break
