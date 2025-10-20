@@ -436,7 +436,7 @@ def load_universe(top_n=None):
 valid = fetch_valid_perp_usdt()
 send_tg(f"[DEBUG] valid_count={len(valid)} | BTCUSDT in valid? { 'BTCUSDT' in valid } | ETHUSDT in valid? { 'ETHUSDT' in valid }")
 # ======================================
-    return out
+return out
 
 def place_market(symbol, side, qty, positionSide=None):
     f=symbol_filters(symbol); qty_str=qty_to_step(qty, f["lot_step"], f["min_qty"])
