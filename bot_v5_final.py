@@ -158,7 +158,7 @@ def send_tg(msg: str) -> None:
     except Exception as e:
         print(f"[TG] Exception sending: {e}")
 
-def _clean_symbol(s: str) -> str:(s: str) -> str:
+def _clean_symbol(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
