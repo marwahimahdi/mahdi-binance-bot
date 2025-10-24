@@ -540,49 +540,78 @@ def maybe_notify_tp_sl(symbol: str, price: float):
 def consensus_signal(df: pd.DataFrame) -> Tuple[str, Dict[str,int]]:
     if df is None or df.empty:
         return "HOLD", {"BUY":0, "SELL":0, "HOLD":1}
+
     ind = indicators(df)
     c = ind["close"].iloc[-1]
     prev_hist = ind["hist"].iloc[-2]; curr_hist = ind["hist"].iloc[-1]
 
     votes = []
     bullish = c > ind["ema50"].iloc[-1]
-    if curr_hist > 0 and prev_hist <= 0 and bullish: votes.append("BUY")
-    elif curr_hist < 0 and prev_hist >= 0 and (not bullish): votes.append("SELL")
-    else: votes.append("HOLD")
 
+    # 1) MACD + EMA50
+    if curr_hist > 0 and prev_hist <= 0 and bullish:
+        votes.append("BUY")
+    elif curr_hist < 0 and prev_hist >= 0 and (not bullish):
+        votes.append("SELL")
+    else:
+        votes.append("HOLD")
+
+    # 2) RSI
     r = float(ind["rsi"].iloc[-1])
-    if r < RSI_SELL_MIN: votes.append("BUY")
-    elif r > RSI_BUY_MAX: votes.append("SELL")
-    else: votes.append("HOLD")
+    if r < RSI_SELL_MIN:
+        votes.append("BUY")
+    elif r > RSI_BUY_MAX:
+        votes.append("SELL")
+    else:
+        votes.append("HOLD")
 
-    if float(ind["adx"].iloc[-1]) >= ADX_MIN: votes.append("TREND_OK")
-    else: votes.append("TREND_WEAK")
+    # 3) ADX
+    adx_val = float(ind["adx"].iloc[-1])
+    if adx_val >= ADX_MIN:
+        votes.append("TREND_OK")
+    else:
+        votes.append("TREND_WEAK")
 
-    if c <= float(ind["bb_dn"].iloc[-1]): votes.append("BUY")
-    elif c >= float(ind["bb_up"].iloc[-1]): votes.append("SELL")
-    else: votes.append("HOLD")
+    # 4) Bollinger
+    if c <= float(ind["bb_dn"].iloc[-1]):
+        votes.append("BUY")
+    elif c >= float(ind["bb_up"].iloc[-1]):
+        votes.append("SELL")
+    else:
+        votes.append("HOLD")
 
-    if c > float(ind["vwap"].iloc[-1]) and bullish: votes.append("BUY")
-    elif c < float(ind["vwap"].iloc[-1]) and (not bullish): votes.append("SELL")
-    else: votes.append("HOLD")
+    # 5) VWAP
+    if c > float(ind["vwap"].iloc[-1]) and bullish:
+        votes.append("BUY")
+    elif c < float(ind["vwap"].iloc[-1]) and (not bullish):
+        votes.append("SELL")
+    else:
+        votes.append("HOLD")
 
+    # فلتر التذبذب
     atr_pct = float(ind["atr"].iloc[-1]) / (c + 1e-9) * 100.0
     if atr_pct < MIN_ATR_PCT:
         return "HOLD", {"BUY":0, "SELL":0, "HOLD":1}
 
+    # حساب عدد الأصوات
     buy_votes  = sum(1 for v in votes if v == "BUY")
     sell_votes = sum(1 for v in votes if v == "SELL")
-    total_votes= buy_votes + sell_votes
-    if total_votes == 0:
-        return "HOLD", {"BUY":0, "SELL":0, "HOLD":1}
+    total_core = 5
 
-    if buy_votes / 5.0 >= CONSENSUS_MIN and "TREND_OK" in votes:
+    trend_ok = ("TREND_OK" in votes)
+
+    # شرط الإجماع: النسبة + العدد الأدنى
+    buy_ok  = trend_ok and (buy_votes  / total_core >= CONSENSUS_MIN) and (buy_votes  >= MIN_AGREE)
+    sell_ok = trend_ok and (sell_votes / total_core >= CONSENSUS_MIN) and (sell_votes >= MIN_AGREE)
+
+    if buy_ok:
         METRICS["signals"] += 1
-        return "BUY", {"BUY":buy_votes, "SELL":sell_votes, "HOLD":5 - total_votes}
-    if sell_votes / 5.0 >= CONSENSUS_MIN and "TREND_OK" in votes:
+        return "BUY", {"BUY":buy_votes, "SELL":sell_votes, "HOLD": total_core - (buy_votes+sell_votes)}
+    if sell_ok:
         METRICS["signals"] += 1
-        return "SELL", {"BUY":buy_votes, "SELL":sell_votes, "HOLD":5 - total_votes}
-    return "HOLD", {"BUY":buy_votes, "SELL":sell_votes, "HOLD":5 - total_votes}
+        return "SELL", {"BUY":buy_votes, "SELL":sell_votes, "HOLD": total_core - (buy_votes+sell_votes)}
+
+    return "HOLD", {"BUY":buy_votes, "SELL":sell_votes, "HOLD": total_core - (buy_votes+sell_votes)}
 
 # ========= دوال حساب قوة الإشارة والرافعة المستهدفة =========
 
