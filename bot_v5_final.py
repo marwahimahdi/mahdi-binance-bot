@@ -826,7 +826,7 @@ def main_loop():
     SLEEP_SEC = int(os.getenv("SLEEP_SEC", "30"))
     while True:
         try:
-            for sym in symbols:
+            for sym in iter_symbols_batched(symbols):
                 sym = _clean_symbol(sym)
                 try:
                     if sym not in open_positions:
