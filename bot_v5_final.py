@@ -23,23 +23,40 @@ load_dotenv()
 
 # ===================== Strategy Profile Switch =====================
 # اختر من .env: STRATEGY_PROFILE=conservative | aggressive
+# === Load Strategy Profile ===
 STRATEGY_PROFILE = os.getenv("STRATEGY_PROFILE", "conservative").lower()
+
+# تحديد قيم الوضع الحالي بناءً على STRATEGY_PROFILE
 if STRATEGY_PROFILE == "conservative":
-    os.environ.update({
-        "CONSENSUS_MIN": "0.50",   # 50% اتفاق
-        "MIN_AGREE": "3",          # 3 من 5
-        "ADX_MIN": "20",           # ترند أقوى
-        "MIN_ATR_PCT": "0.25",     # تذبذب أدنى أعلى (أكثر تحفظًا)
-        "MAX_RISK_PCT": "0.0025",  # 0.25% من الرصيد
-    })
+    PROFILE_ICON = "🛡️"
+    PROFILE_NAME = "Conservative"
+    CONSENSUS_MIN = 0.50
+    MIN_AGREE = 3
+    ADX_MIN = 20
+    MIN_ATR_PCT = 0.25
+    MAX_RISK_PCT = 0.0025
+
 elif STRATEGY_PROFILE == "aggressive":
-    os.environ.update({
-        "CONSENSUS_MIN": "0.60",   # 60% اتفاق
-        "MIN_AGREE": "2",          # 2 من 5
-        "ADX_MIN": "10",           # يقبل ترند أضعف
-        "MIN_ATR_PCT": "0.15",     # يقبل تذبذب أقل
-        "MAX_RISK_PCT": "0.0045",  # 0.45% من الرصيد
-    })
+    PROFILE_ICON = "⚔️"
+    PROFILE_NAME = "Aggressive"
+    CONSENSUS_MIN = 0.60
+    MIN_AGREE = 2
+    ADX_MIN = 10
+    MIN_ATR_PCT = 0.15
+    MAX_RISK_PCT = 0.0045
+
+elif STRATEGY_PROFILE == "aggressive-lite":
+    PROFILE_ICON = "⚡"
+    PROFILE_NAME = "Aggressive-Lite"
+    CONSENSUS_MIN = 0.60
+    MIN_AGREE = 2
+    ADX_MIN = 10
+    MIN_ATR_PCT = 0.15
+    MAX_RISK_PCT = 0.0045
+else:
+    PROFILE_ICON = "⚙️"
+    PROFILE_NAME = "Custom"
+
 
 API_KEY     = os.getenv("API_KEY", "")
 API_SECRET  = os.getenv("API_SECRET", "")
@@ -762,6 +779,8 @@ def load_universe(top_n: Optional[int] = None) -> List[str]:
 def main_loop():
     global _last_summary_ts, _last_heartbeat_ts, _session_start_balance, _session_day
     send_tg("🚀 MahdiBot v5 PRO — ALL Add-ons Enabled")
+    send_tg(f"{PROFILE_ICON} Profile Loaded: {PROFILE_NAME} ({MIN_AGREE}/5 consensus, relaxed filters)" if STRATEGY_PROFILE == "aggressive-lite"
+        else f"{PROFILE_ICON} Profile Loaded: {PROFILE_NAME} ({MIN_AGREE}/5 consensus)")
 
     # تحميل الكون عند الإقلاع مع Backoff ضد الحظر
     while True:
