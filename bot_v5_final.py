@@ -185,6 +185,26 @@ def send_tg(msg: str) -> None:
     except Exception as e:
         print(f"[TG] Exception sending: {e}")
 
+# ====== Batching Helpers ======
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
+BATCH_PAUSE_SEC = float(os.getenv("BATCH_PAUSE_SEC", "1.0"))
+
+def _chunked(seq, size):
+    size = max(1, int(size))
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
+
+def iter_symbols_batched(symbols):
+    """
+    يولّد الرموز على دفعات ويوقّف قليلاً بين كل دفعة لتخفيف ضغط REST.
+    استبدل أي 'for sym in symbols:' بـ 'for sym in iter_symbols_batched(symbols):'
+    """
+    for batch in _chunked(list(symbols), BATCH_SIZE):
+        for sym in batch:
+            yield sym
+        time.sleep(BATCH_PAUSE_SEC)
+
+
 def _clean_symbol(s: str) -> str:
     if s is None:
         return ""
