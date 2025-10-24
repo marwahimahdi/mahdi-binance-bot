@@ -824,8 +824,31 @@ def main_loop():
     _session_start_balance = get_balance_usdt()
 
     SLEEP_SEC = int(os.getenv("SLEEP_SEC", "30"))
+    _last_universe_ts = 0  # تتبّع آخر تحديث لقائمة الأزواج
     while True:
         try:
+                    # === Refresh universe periodically (every UNIVERSE_REFRESH_MIN minutes) ===
+        now_ts = time.time()
+        try:
+            refresh_sec = int(os.getenv("UNIVERSE_REFRESH_MIN", "5")) * 60
+        except Exception:
+            refresh_sec = 300
+if now_ts - _last_universe_ts >= refresh_sec:
+    new_symbols = load_universe(MAX_SYMBOLS)
+
+    if new_symbols and new_symbols != symbols:
+        symbols = new_symbols
+        try:
+            send_tg(
+                f"🔄 Universe refreshed (n={len(symbols)}): "
+                f"{', '.join(symbols[:12])}{'…' if len(symbols) > 12 else ''}"
+            )
+            send_universe_details(symbols)  # اختياري
+        except Exception:
+            pass
+
+    _last_universe_ts = now_ts
+
             for sym in iter_symbols_batched(symbols):
                 sym = _clean_symbol(sym)
                 try:
