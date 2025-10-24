@@ -1,9 +1,9 @@
-# MahdiBot v5 PRO — Conservative + Dual TF + Hourly Summary + Advanced Risk Add-ons (ALL Enabled)
+# MahdiBot v5 PRO — Conservative/Aggressive Profiles + Dual TF + Hourly Summary + Advanced Risk Add-ons (ALL Enabled)
 # ----------------------------------------------------------------------------------
 # - Auto-TopN بدون CSV + فلتر سيولة دنيا (MIN_QUOTEVOL_USDT) مع كاش 60s لنداء 24h
 # - فلتر اتجاه بالفريم الأعلى 15m (EMA50/MACD-hist) + خيار EMA200
-# - إجماع 5 مؤشرات على 5m مع نسبة CONSENSUS_MIN و MIN_AGREE
-# - 3 أهداف TP + وقف متحرك ATR + Breakeven بعد TP1 + Trail أقوى بعد TP2
+# - إجماع 5 مؤشرات على 5m مع نسبة CONSENSUS_MIN و MIN_AGREE (حسب البروفايل)
+# - 3 أهداف TP + وقف متحرك ATR + Breakeven بعد TP1 + Trail أقوى بعد TP2  (لم يتم تعديلها)
 # - Batching للرموز + REST Throttle + Backoff عند الحظر (-1003/418)
 # - حد أقصى للصفقات المتزامنة، تبريد بعد SL، منع إعادة الدخول، حد خسارة يومي
 # - ملخص كل ساعة + Heartbeat
@@ -20,6 +20,26 @@ from dotenv import load_dotenv
 
 # ===================== تحميل البيئة =====================
 load_dotenv()
+
+# ===================== Strategy Profile Switch =====================
+# اختر من .env: STRATEGY_PROFILE=conservative | aggressive
+STRATEGY_PROFILE = os.getenv("STRATEGY_PROFILE", "conservative").lower()
+if STRATEGY_PROFILE == "conservative":
+    os.environ.update({
+        "CONSENSUS_MIN": "0.50",   # 50% اتفاق
+        "MIN_AGREE": "3",          # 3 من 5
+        "ADX_MIN": "20",           # ترند أقوى
+        "MIN_ATR_PCT": "0.25",     # تذبذب أدنى أعلى (أكثر تحفظًا)
+        "MAX_RISK_PCT": "0.0025",  # 0.25% من الرصيد
+    })
+elif STRATEGY_PROFILE == "aggressive":
+    os.environ.update({
+        "CONSENSUS_MIN": "0.60",   # 60% اتفاق
+        "MIN_AGREE": "2",          # 2 من 5
+        "ADX_MIN": "10",           # يقبل ترند أضعف
+        "MIN_ATR_PCT": "0.15",     # يقبل تذبذب أقل
+        "MAX_RISK_PCT": "0.0045",  # 0.45% من الرصيد
+    })
 
 API_KEY     = os.getenv("API_KEY", "")
 API_SECRET  = os.getenv("API_SECRET", "")
@@ -445,6 +465,7 @@ def fmt_votes(v: Dict[str,int]) -> str:
     return f"B={v.get('BUY',0)} S={v.get('SELL',0)} H={v.get('HOLD',0)}"
 
 def compute_sl_tp(entry: float, atr: float, side: str) -> Tuple[float, float, float, float]:
+    # (لا تعديل على منطق SL/TP)
     if side == "BUY":
         sl = entry - STOP_ATR_MULT * atr
         tp1 = entry + TP1_R_MULT * (entry - sl)
@@ -458,6 +479,7 @@ def compute_sl_tp(entry: float, atr: float, side: str) -> Tuple[float, float, fl
     return sl, tp1, tp2, tp3
 
 def manage_trailing(symbol: str, side: str, entry: float, atr: float, qty_left: float):
+    # (لا تعديل على منطق التريلينغ)
     price = get_price(symbol)
     sl = open_positions[symbol]["sl"]
     trail_mult = open_positions[symbol].get("trail_mult", TRAIL_ATR_MULT)
@@ -475,6 +497,7 @@ def manage_trailing(symbol: str, side: str, entry: float, atr: float, qty_left: 
             send_tg(f"🔁 Trailing SL {symbol} -> {new_sl:.4f} | rem={qty_left}")
 
 def maybe_notify_tp_sl(symbol: str, price: float):
+    # (لا تعديل على منطق إشعارات TP/SL و BE و Trail بعد TP2)
     st = open_positions.get(symbol)
     if not st: return
     side, entry, sl, atr = st["side"], st["entry"], st["sl"], st["atr"]
@@ -690,7 +713,7 @@ def try_enter(symbol: str):
     send_tg(
         f"✅ ENTRY{strong_tag} {symbol} {side} qty={qty} @~{price:.4f}\n"
         f"SL {sl:.4f} | R={r_unit:.4f} | TP1 {tp1:.4f}({TP1_PCT_CLOSE*100:.0f}%) TP2 {tp2:.4f}({TP2_PCT_CLOSE*100:.0f}%) TP3 {tp3:.4f}({TP3_PCT_CLOSE*100:.0f}%)\n"
-        f"profile={RISK_PROFILE} | HTF={trend} | lev={lev_to_use}x | conf={conf:.2f} | margin={DEFAULT_MARGIN_TYPE}"
+        f"profile={RISK_PROFILE}/{STRATEGY_PROFILE} | HTF={trend} | lev={lev_to_use}x | conf={conf:.2f} | margin={DEFAULT_MARGIN_TYPE}"
     )
 
 # ============== ملخص كل ساعة ==============
@@ -704,7 +727,7 @@ def hourly_summary():
         f"│ SL hits      │ {METRICS['sl_hits']:>6} │",
         f"│ Realized PnL │ {METRICS['realized_pnl']:>6.4f} │",
         "└──────────────┴────────┘",
-        f"mode={RUN_MODE} | lev={LEVERAGE}x | margin={DEFAULT_MARGIN_TYPE} | profile={RISK_PROFILE} | TF={INTERVAL}->{HTF_INTERVAL}"
+        f"mode={RUN_MODE} | lev={LEVERAGE}x | margin={DEFAULT_MARGIN_TYPE} | profile={RISK_PROFILE}/{STRATEGY_PROFILE} | TF={INTERVAL}->{HTF_INTERVAL}"
     ]
     send_tg("\n".join(lines))
 
@@ -761,7 +784,7 @@ def main_loop():
     print("Universe:", symbols)
     send_tg(
         f"📊 Universe (n={len(symbols)}): {', '.join(symbols[:12])}{'…' if len(symbols)>12 else ''}\n"
-        f"mode={RUN_MODE} | lev={LEVERAGE}x | margin={DEFAULT_MARGIN_TYPE} | profile={RISK_PROFILE} | TF={INTERVAL}->{HTF_INTERVAL}"
+        f"mode={RUN_MODE} | lev={LEVERAGE}x | margin={DEFAULT_MARGIN_TYPE} | profile={RISK_PROFILE}/{STRATEGY_PROFILE} | TF={INTERVAL}->{HTF_INTERVAL}"
     )
     send_universe_details(symbols)
 
