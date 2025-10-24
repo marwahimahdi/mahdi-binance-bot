@@ -827,27 +827,50 @@ def main_loop():
     _last_universe_ts = 0  # تتبّع آخر تحديث لقائمة الأزواج
     while True:
         try:
-                    # === Refresh universe periodically (every UNIVERSE_REFRESH_MIN minutes) ===
-        now_ts = time.time()
-        try:
-            refresh_sec = int(os.getenv("UNIVERSE_REFRESH_MIN", "5")) * 60
-        except Exception:
-            refresh_sec = 300
-if now_ts - _last_universe_ts >= refresh_sec:
-    new_symbols = load_universe(MAX_SYMBOLS)
+            # === Refresh universe periodically (every UNIVERSE_REFRESH_MIN minutes) ===
+            now_ts = time.time()
+            try:
+                refresh_sec = int(os.getenv("UNIVERSE_REFRESH_MIN", "5")) * 60
+            except Exception:
+                refresh_sec = 300
 
-    if new_symbols and new_symbols != symbols:
-        symbols = new_symbols
-        try:
-            send_tg(
-                f"🔄 Universe refreshed (n={len(symbols)}): "
-                f"{', '.join(symbols[:12])}{'…' if len(symbols) > 12 else ''}"
-            )
-            send_universe_details(symbols)  # اختياري
-        except Exception:
-            pass
+            if now_ts - _last_universe_ts >= refresh_sec:
+                new_symbols = load_universe(MAX_SYMBOLS)
 
-    _last_universe_ts = now_ts
+                if new_symbols and new_symbols != symbols:
+                    symbols = new_symbols
+                    try:
+                        send_tg(
+                            f"🔄 Universe refreshed (n={len(symbols)}): "
+                            f"{', '.join(symbols[:12])}{'…' if len(symbols) > 12 else ''}"
+                        )
+                        send_universe_details(symbols)  # اختياري
+                    except Exception:
+                        pass
+
+                _last_universe_ts = now_ts
+
+            for sym in iter_symbols_batched(symbols):
+                sym = _clean_symbol(sym)
+                try:
+                    if sym not in open_positions:
+                        try_enter(sym)
+                    else:
+                        pos = open_positions[sym]
+                        price = get_price(sym)
+                        manage_trailing(sym, pos["side"], pos["entry"], pos["atr"], pos["qty_left"])
+                        maybe_notify_tp_sl(sym, price)
+                except HttpErr as he:
+                    if "-1121" in str(he):
+                        send_tg(f"⚠️ {sym}: Invalid symbol — شُطب.")
+                    else:
+                        send_tg(f"⚠️ {sym}: Error {he}")
+                time.sleep(0.2)
+
+            now_ts = time.time()
+            if now_ts - _last_summary_ts >= SUMMARY_EVERY_SEC:
+                hourly_summary()
+                _last_summary_ts = now_ts
 
             for sym in iter_symbols_batched(symbols):
                 sym = _clean_symbol(sym)
