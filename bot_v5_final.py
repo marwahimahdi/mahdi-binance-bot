@@ -70,6 +70,7 @@ TP3_PCT_CLOSE   = float(os.getenv("TP3_PCT_CLOSE", "0.20"))
 
 # فلاتر إشارة
 CONSENSUS_MIN   = float(os.getenv("CONSENSUS_MIN", "0.6"))
+MIN_AGREE       = int(os.getenv("MIN_AGREE", "3"))
 ADX_MIN         = float(os.getenv("ADX_MIN", "15"))
 RSI_BUY_MAX     = float(os.getenv("RSI_BUY_MAX", "70"))
 RSI_SELL_MIN    = float(os.getenv("RSI_SELL_MIN", "30"))
