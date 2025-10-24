@@ -1,3 +1,7 @@
+# MahdiBot v5 Final — Multi-Profile Edition (Conservative / Aggressive / Aggressive-Lite)
+# Integrated Dynamic Risk, SL/TP, and Telegram Alerts
+# Fully compatible with mahdi-bot.env (v5)
+
 # MahdiBot v5 PRO — Conservative/Aggressive Profiles + Dual TF + Hourly Summary + Advanced Risk Add-ons (ALL Enabled)
 # ----------------------------------------------------------------------------------
 # - Auto-TopN بدون CSV + فلتر سيولة دنيا (MIN_QUOTEVOL_USDT) مع كاش 60s لنداء 24h
@@ -64,6 +68,9 @@ MIN_AGREE     = int(os.getenv("MIN_AGREE", str(MIN_AGREE)))
 ADX_MIN       = float(os.getenv("ADX_MIN", str(ADX_MIN)))
 MIN_ATR_PCT   = float(os.getenv("MIN_ATR_PCT", str(MIN_ATR_PCT)))
 MAX_RISK_PCT  = float(os.getenv("MAX_RISK_PCT", str(MAX_RISK_PCT)))
+RSI_BUY_MAX   = float(os.getenv("RSI_BUY_MAX", "70"))
+RSI_SELL_MIN  = float(os.getenv("RSI_SELL_MIN", "30"))
+
 
 def _debug_profile_values():
     try:
@@ -76,8 +83,7 @@ def _debug_profile_values():
     except Exception:
         pass
 
-# نادِ الدالة بعد إنهاء قراءة جميع المتغيّرات
-_debug_profile_values()
+# (debug will be called after send_tg is defined)
 
 
 API_KEY     = os.getenv("API_KEY", "")
@@ -111,7 +117,7 @@ DEFAULT_MARGIN_TYPE = os.getenv("DEFAULT_MARGIN_TYPE", "ISOLATED").upper()
 LEVERAGE          = int(os.getenv("LEVERAGE", "5"))
 
 RISK_PROFILE      = os.getenv("RISK_PROFILE", "conservative").lower()
-MAX_RISK_PCT      = float(os.getenv("MAX_RISK_PCT", "0.0035"))
+MAX_RISK_PCT      = float(os.getenv("MAX_RISK_PCT", str(MAX_RISK_PCT)))
 STOP_ATR_MULT     = float(os.getenv("STOP_ATR_MULT", "1.3"))
 TRAIL_ATR_MULT    = float(os.getenv("TRAIL_ATR_MULT", "0.8"))
 TP1_R_MULT        = float(os.getenv("TP1_R_MULT", "0.9"))
@@ -187,6 +193,12 @@ def send_tg(msg: str) -> None:
             print(f"[TG] sendMessage failed {r.status_code}: {r.text}")
     except Exception as e:
         print(f"[TG] Exception sending: {e}")
+
+# نادِ الدالة بعد تعريف send_tg لضمان وصول الرسالة
+try:
+    _debug_profile_values()
+except Exception:
+    pass
 
 # ====== Batching Helpers ======
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
