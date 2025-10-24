@@ -57,6 +57,28 @@ else:
     PROFILE_ICON = "⚙️"
     PROFILE_NAME = "Custom"
 
+# === Allow .env to override profile defaults (if provided) ===
+# نحافظ على قيم البروفايل كأساس، وإذا وُجدت قيم في .env تُستعمل بدلها
+CONSENSUS_MIN = float(os.getenv("CONSENSUS_MIN", str(CONSENSUS_MIN)))
+MIN_AGREE     = int(os.getenv("MIN_AGREE", str(MIN_AGREE)))
+ADX_MIN       = float(os.getenv("ADX_MIN", str(ADX_MIN)))
+MIN_ATR_PCT   = float(os.getenv("MIN_ATR_PCT", str(MIN_ATR_PCT)))
+MAX_RISK_PCT  = float(os.getenv("MAX_RISK_PCT", str(MAX_RISK_PCT)))
+
+def _debug_profile_values():
+    try:
+        send_tg(
+            f"{PROFILE_ICON} Profile Loaded: {PROFILE_NAME} "
+            f"— CONS_MIN={CONSENSUS_MIN:.2f}, MIN_AGREE={MIN_AGREE}, "
+            f"ADX_MIN={ADX_MIN:.1f}, MIN_ATR%={MIN_ATR_PCT:.2f}, "
+            f"MAX_RISK%={MAX_RISK_PCT:.4f}"
+        )
+    except Exception:
+        pass
+
+# نادِ الدالة بعد إنهاء قراءة جميع المتغيّرات
+_debug_profile_values()
+
 
 API_KEY     = os.getenv("API_KEY", "")
 API_SECRET  = os.getenv("API_SECRET", "")
@@ -99,12 +121,6 @@ TP1_PCT_CLOSE     = float(os.getenv("TP1_PCT_CLOSE", "0.50"))
 TP2_PCT_CLOSE     = float(os.getenv("TP2_PCT_CLOSE", "0.30"))
 TP3_PCT_CLOSE     = float(os.getenv("TP3_PCT_CLOSE", "0.20"))
 
-CONSENSUS_MIN     = float(os.getenv("CONSENSUS_MIN", "0.60"))
-MIN_AGREE         = int(os.getenv("MIN_AGREE", "3"))
-ADX_MIN           = float(os.getenv("ADX_MIN", "15"))
-RSI_BUY_MAX       = float(os.getenv("RSI_BUY_MAX", "70"))
-RSI_SELL_MIN      = float(os.getenv("RSI_SELL_MIN", "30"))
-MIN_ATR_PCT       = float(os.getenv("MIN_ATR_PCT", "0.20"))
 
 BREAKEVEN_AFTER_TP1 = os.getenv("BREAKEVEN_AFTER_TP1", "true").lower() == "true"
 BE_OFFSET_MULT      = float(os.getenv("BE_OFFSET_MULT", "0.05"))
