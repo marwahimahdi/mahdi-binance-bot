@@ -85,6 +85,10 @@ def _debug_profile_values():
 
 # (debug will be called after send_tg is defined)
 
+# === Request window & time sync ===
+RECV_WINDOW = int(os.getenv("RECV_WINDOW", "10000"))
+TIME_SYNC   = os.getenv("TIME_SYNC", "true").lower() == "true"
+
 
 API_KEY     = os.getenv("API_KEY", "")
 API_SECRET  = os.getenv("API_SECRET", "")
@@ -164,6 +168,9 @@ FUNDING_EP    = f"{BASE_URL}/fapi/v1/premiumIndex"
 
 SESSION = requests.Session()
 SESSION.headers.update({"Content-Type": "application/json"})
+if TIME_SYNC:
+    sync_time()
+
 
 # ===================== عدّادات الجلسة =====================
 METRICS = {"signals": 0, "trades": 0, "tp_hits": 0, "sl_hits": 0, "realized_pnl": 0.0}
@@ -178,8 +185,24 @@ _session_start_balance = None
 class HttpErr(requests.HTTPError):
     pass
 
+# === Time sync with Binance ===
+_ts_offset_ms = 0  # فرق وقت الخادم عن وقت الجهاز (ms)
+
+def sync_time():
+    """يسحب serverTime من Binance ويحسب الإزاحة."""
+    global _ts_offset_ms
+    try:
+        resp = SESSION.get(f"{BASE_URL}/fapi/v1/time", timeout=10)
+        srv = resp.json()
+        _ts_offset_ms = int(srv["serverTime"]) - int(time.time() * 1000)
+    except Exception:
+        _ts_offset_ms = 0
+
 def now_ts_ms() -> int:
-    return int(datetime.now(timezone.utc).timestamp() * 1000)
+    # نستخدم توقيت UTC + إزاحة الخادم إذا TIME_SYNC=True
+    base = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return base + (_ts_offset_ms if TIME_SYNC else 0)
+
 
 def send_tg(msg: str) -> None:
     if not TG_TOKEN or not TG_CHAT_ID:
