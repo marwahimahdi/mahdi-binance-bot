@@ -168,8 +168,6 @@ FUNDING_EP    = f"{BASE_URL}/fapi/v1/premiumIndex"
 
 SESSION = requests.Session()
 SESSION.headers.update({"Content-Type": "application/json"})
-if TIME_SYNC:
-    sync_time()
 
 
 # ===================== عدّادات الجلسة =====================
@@ -197,6 +195,9 @@ def sync_time():
         _ts_offset_ms = int(srv["serverTime"]) - int(time.time() * 1000)
     except Exception:
         _ts_offset_ms = 0
+
+if TIME_SYNC:
+    sync_time()
 
 def now_ts_ms() -> int:
     # نستخدم توقيت UTC + إزاحة الخادم إذا TIME_SYNC=True
